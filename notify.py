@@ -1,0 +1,56 @@
+"""
+告警模块：仅在控制台打印告警信息。
+
+历史上这个模块通过 Gmail SMTP 发邮件给 dracarys001mike@gmail.com，
+v3.5（员工分发版）起改为纯本地输出 —— 员工电脑无须配 SMTP，截图也只
+存到本地 screenshots/ 子目录。函数签名保留兼容性，调用方无须改动。
+"""
+
+from datetime import datetime
+from pathlib import Path
+
+
+def _log(level: str, subject: str, body: str, screenshot_path: str | None) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print("=" * 60)
+    print(f"  [{level}] {ts}")
+    print(f"  {subject}")
+    for line in (body or "").splitlines():
+        print(f"    {line}")
+    if screenshot_path and Path(screenshot_path).is_file():
+        print(f"  截图: {screenshot_path}")
+    print("=" * 60)
+
+
+def send_alert(subject: str, body: str, screenshot_path: str | None = None) -> bool:
+    """兼容入口：旧代码可能直接调用 send_alert。"""
+    _log("ALERT", subject, body, screenshot_path)
+    return True
+
+
+def alert_captcha(url: str, screenshot_path: str | None = None) -> bool:
+    """验证码拦截 —— 提示员工手动通过。"""
+    _log(
+        "验证码",
+        "Shein 爬虫遇到验证码，请在 Chrome 窗口手动通过",
+        f"页面: {url}",
+        screenshot_path,
+    )
+    return True
+
+
+def alert_signin(url: str, screenshot_path: str | None = None) -> bool:
+    """登录弹窗自动关闭失败 —— 提示员工手动处理。"""
+    _log(
+        "登录弹窗",
+        "Shein 要求登录，自动关闭失败，请在 Chrome 窗口手动处理",
+        f"页面: {url}",
+        screenshot_path,
+    )
+    return True
+
+
+def alert_generic(url: str, message: str, screenshot_path: str | None = None) -> bool:
+    """通用异常 —— 仅打印，不阻塞主流程。"""
+    _log("异常", message, f"页面: {url}", screenshot_path)
+    return True
