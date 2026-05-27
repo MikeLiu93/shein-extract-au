@@ -1324,6 +1324,37 @@ def _ebay_listing_price(price: float, shipping: float) -> float:
     return round(float(price or 0) * EBAY_MARKUP + float(shipping or 0), 2)
 
 
+def _merge_main_sale_attr_colors(variations: dict, main_sale_attrs: list) -> dict:
+    """mainSaleAttribute 是颜色变体的权威清单（每个颜色 = 独立 goods_sn）。
+
+    DOM 抓取在 URL 预选了某颜色时（?main_attr=...）只会拿到选中的那一个，
+    导致其它颜色丢失。用 main_sale_attrs 的完整颜色列表覆盖 variations 中
+    对应属性（按 attr_name 大小写不敏感匹配，保留原 key 的写法）。
+    """
+    if not main_sale_attrs:
+        return variations
+    variations = dict(variations or {})
+    attr_name = ""
+    vals, seen = [], set()
+    for msa in main_sale_attrs:
+        nm = (msa.get("attr_name") or "").strip()
+        vv = (msa.get("attr_value_name") or "").strip()
+        if nm and not attr_name:
+            attr_name = nm
+        if not vv:
+            continue
+        k = vv.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        vals.append(vv)
+    if not attr_name or not vals:
+        return variations
+    existing = next((k for k in variations if k.lower() == attr_name.lower()), None)
+    variations[existing or attr_name] = vals
+    return variations
+
+
 def _split_variations_for_excel(variations: dict, sku_prices: list = None,
                                 shipping: float = 0.0) -> tuple[str, str]:
     """
@@ -2009,13 +2040,15 @@ def _make_ebay_title(original_title: str, variations: dict, max_len: int = 80) -
     t = re.sub(r'^\s*[,;]\s*', '', t)      # leading separator
     t = _clean_ws(t)
 
-    # 2) Extract color from variations
+    # 2) Extract color from variations — only when there's a SINGLE color.
+    # 多色商品（带颜色变体）标题不拼具体颜色，颜色全在 Variation 列里展示，
+    # 也避免与下载的（选中色）图片对不上。与下方内联 color 追加逻辑一致。
     color = ""
     if isinstance(variations, dict):
         for k in variations.keys():
             if "color" in (k or "").lower():
                 vals = variations.get(k) or []
-                if isinstance(vals, list) and vals:
+                if isinstance(vals, list) and len(vals) == 1:
                     color = _clean_ws(str(vals[0]))
                 break
 
@@ -2489,16 +2522,20 @@ def _download_media(rec: dict, base_dir: "Path", seq_num: "int | None" = None) -
 
 # ── Public function ───────────────────────────────────────────────────────────
 
-def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None):
+def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
+                 price_list=None):
     """
     抓取一个或多个 Shein 商品 URL，保存到 Excel。
 
     Parameters
     ----------
-    urls      : str | list[str]
-    output    : str               输出 .xlsx 文件名
-    start_seq : int               Excel 第一列序号起始值
-    seq_list  : list[int] | None  每个 URL 对应的序号（用于 retry，覆盖 start_seq）
+    urls       : str | list[str]
+    output     : str               输出 .xlsx 文件名
+    start_seq  : int               Excel 第一列序号起始值
+    seq_list   : list[int] | None  每个 URL 对应的序号（用于 retry，覆盖 start_seq）
+    price_list : list[float|None] | None  每个 URL 对应的手动售价（USD）；非 None
+                 则覆盖网页爬取的 sale_price，并据此重算 shipping/eBay price。
+                 网页原始售价仍会回传到记录的 web_price 字段（写入 Excel H 列）。
     """
     if isinstance(urls, str):
         urls = [urls]
@@ -2658,6 +2695,26 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
                 if not isinstance(data, dict):
                     raise ValueError("JS returned unexpected type — page may not have loaded")
 
+                # 颜色变体修正：DOM 在预选颜色(?main_attr=...)时只拿到选中的一个，
+                # 用 mainSaleAttribute 的完整颜色清单补全 variations
+                data["variations"] = _merge_main_sale_attr_colors(
+                    data.get("variations") or {}, data.get("main_sale_attrs") or [])
+
+                # 网页爬到的原始售价（覆盖前），回传到 web_price 写入 Excel H 列
+                web_price = data.get("price")
+                # 手动售价覆盖：C 列价格替代网页 sale_price（用户填写更可靠）。
+                # 同时把每个 sku_prices 变体的 sale_price 也改成 C 列价格，
+                # 这样下游"各变体价格"、变体子行、Variation 2 显示等都用同一价格。
+                override_price = (price_list[i - 1] if price_list else None)
+                if override_price is not None:
+                    op = float(override_price)
+                    data["price"] = op
+                    for _sp in (data.get("sku_prices") or []):
+                        _sp["sale_price"] = op
+                    print(f"  [price override] C列=${op:.2f} "
+                          f"(网页=${(web_price or 0):.2f}, "
+                          f"sku_prices×{len(data.get('sku_prices') or [])} 同步)")
+
                 shipping = _calc_shipping(data)
                 price    = data.get("price") or 0.0
                 ebay     = _ebay_listing_price(price, shipping)
@@ -2679,6 +2736,7 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None)
                 rec.update({
                     "sku":            data.get("goods_sn") or data.get("goods_id", ""),
                     "price":          price,
+                    "web_price":      web_price,
                     "shipping":       shipping,
                     "shipping_raw":   data.get("shipping_raw") or "",
                     "free_threshold": data.get("free_threshold"),

@@ -10,10 +10,14 @@ Usage:
 Columns (strict):
     A: Seq       — sequence number (= output folder name). READ ONLY.
     B: Website   — Shein product URL. READ ONLY.
-    C: Date      — filled after run: YYYY-MM-DD. WRITE.
-    D: Status    — filled after run: Done / Failed / Delisted. WRITE.
+    C: Price     — manual product price (USD). READ ONLY. Overrides web sale_price.
+    D: Date      — filled after run: YYYY-MM-DD. WRITE.
+    E: Status    — filled after run: Done / Failed / Delisted. WRITE.
+    H: Web price — web-scraped sale price, for manual comparison with C. WRITE.
 
-Only rows with BOTH Date and Status empty are processed.
+Only rows where Website AND Price are both filled (and Date+Status both empty)
+are processed. Rows with an empty Price are skipped — Price doubles as the
+"this row is ready" flag.
 """
 
 import argparse
@@ -79,20 +83,35 @@ def process_excel(xlsx_path: Path) -> None:
         store = ws_name.strip()
         logger.info("Sheet: %s", store)
 
-        # Normalize header: accept "Execute Date" or "Date" in col C
-        header_c = str(ws.cell(1, 3).value or "").strip()
-        if header_c in ("Execute Date", ""):
-            ws.cell(1, 3).value = "Date"
+        # Normalize headers: col C = Price, col D = Date
+        if str(ws.cell(1, 3).value or "").strip() == "":
+            ws.cell(1, 3).value = "Price"
+        header_d = str(ws.cell(1, 4).value or "").strip()
+        if header_d in ("Execute Date", ""):
+            ws.cell(1, 4).value = "Date"
+        if str(ws.cell(1, 8).value or "").strip() == "":
+            ws.cell(1, 8).value = "Web price"
 
-        # Collect pending rows (Date AND Status both empty)
+        # Collect pending rows: Website AND Price filled, Date AND Status empty.
+        # Empty Price → skip (Price doubles as the "ready to process" flag).
         pending = []
         for row in range(2, ws.max_row + 1):
             seq = ws.cell(row, 1).value
             url = ws.cell(row, 2).value
-            date_val = ws.cell(row, 3).value
-            status_val = ws.cell(row, 4).value
-            if url and seq is not None and not date_val and not status_val:
-                pending.append((row, int(seq), str(url).strip()))
+            price_val = ws.cell(row, 3).value
+            date_val = ws.cell(row, 4).value
+            status_val = ws.cell(row, 5).value
+            if (url and seq is not None and price_val not in (None, "")
+                    and not date_val and not status_val):
+                try:
+                    price_f = float(price_val)
+                except (TypeError, ValueError):
+                    price_f = None
+                if price_f is None:
+                    logger.info("    seq %s → skip (Price '%s' not numeric)",
+                                seq, price_val)
+                    continue
+                pending.append((row, int(seq), str(url).strip(), price_f))
 
         if not pending:
             logger.info("  No pending rows in '%s'", store)
@@ -108,6 +127,7 @@ def process_excel(xlsx_path: Path) -> None:
         # Run scraper
         urls = [p[2] for p in pending]
         seqs = [p[1] for p in pending]
+        prices = [p[3] for p in pending]
         today = datetime.now().strftime("%Y-%m-%d")
         seq_min, seq_max = min(seqs), max(seqs)
         xlsx_name = f"{store}-{seq_min}-{seq_max}-{today.replace('-', '')}.xlsx"
@@ -125,7 +145,8 @@ def process_excel(xlsx_path: Path) -> None:
             else:
                 os.chdir(store_dir)  # final attempt, let it raise
             logger.info("  Scraping %d URLs → %s/%s", len(urls), store, xlsx_name)
-            results = scrape_shein(urls, output=xlsx_name, seq_list=seqs)
+            results = scrape_shein(urls, output=xlsx_name, seq_list=seqs,
+                                   price_list=prices)
         except RateLimitError:
             logger.warning("  [限流] Rate limited during '%s'", store)
         except Exception as e:
@@ -139,7 +160,7 @@ def process_excel(xlsx_path: Path) -> None:
             os.chdir(old_cwd)
 
         # Update Date + Status based on results
-        for row_idx, seq, url in pending:
+        for row_idx, seq, url, _price in pending:
             seq_folder = store_dir / str(seq)
             has_files = seq_folder.is_dir() and any(seq_folder.iterdir())
 
@@ -147,24 +168,29 @@ def process_excel(xlsx_path: Path) -> None:
             if results:
                 rec = next((r for r in results if r.get("seq_num") == seq), None)
 
+            # Web price (col H): the web-scraped sale price, for manual
+            # comparison against the manual Price in col C.
+            if rec and rec.get("web_price") is not None:
+                ws.cell(row_idx, 8).value = rec["web_price"]
+
             is_bad_data = (rec and rec.get("status") == "OK"
                            and (not rec.get("sku")
                                 or "[goods_name]" in (rec.get("title") or "")))
 
             if has_files and not is_bad_data:
-                ws.cell(row_idx, 3).value = today
-                ws.cell(row_idx, 4).value = "Done"
+                ws.cell(row_idx, 4).value = today
+                ws.cell(row_idx, 5).value = "Done"
                 logger.info("    seq %d → Done", seq)
             elif rec and rec.get("status") == "DELISTED":
-                ws.cell(row_idx, 3).value = today
-                ws.cell(row_idx, 4).value = "Delisted"
+                ws.cell(row_idx, 4).value = today
+                ws.cell(row_idx, 5).value = "Delisted"
                 logger.info("    seq %d → Delisted", seq)
             else:
                 detail = rec.get("status", "") if rec else ""
                 if is_bad_data:
                     detail = "no data loaded"
-                ws.cell(row_idx, 3).value = today
-                ws.cell(row_idx, 4).value = "Failed"
+                ws.cell(row_idx, 4).value = today
+                ws.cell(row_idx, 5).value = "Failed"
                 logger.info("    seq %d → Failed %s", seq,
                             f"({detail})" if detail else "")
 
