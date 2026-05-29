@@ -73,9 +73,14 @@ def safe_save(wb, xlsx_path: Path) -> None:
         logger.info("Saved to alternate: %s", alt.name)
 
 
-def process_excel(xlsx_path: Path) -> None:
-    """Process all worksheets in an Excel file."""
-    logger.info("Opening: %s", xlsx_path.name)
+def process_excel(xlsx_path: Path, gate_price: bool = True) -> None:
+    """Process all worksheets in an Excel file.
+
+    gate_price=True (default): only rows with both Website AND Price filled
+    are processed; empty-Price rows are skipped. gate_price=False: empty-Price
+    rows are also processed, using the web-scraped price (no manual override).
+    """
+    logger.info("Opening: %s  (gate_price=%s)", xlsx_path.name, gate_price)
     wb = load_workbook(xlsx_path)
 
     for ws_name in wb.sheetnames:
@@ -92,8 +97,9 @@ def process_excel(xlsx_path: Path) -> None:
         if str(ws.cell(1, 8).value or "").strip() == "":
             ws.cell(1, 8).value = "Web price"
 
-        # Collect pending rows: Website AND Price filled, Date AND Status empty.
-        # Empty Price → skip (Price doubles as the "ready to process" flag).
+        # Collect pending rows. gate_price=True (default): require Price filled
+        # (Price doubles as the "ready to list" flag). gate_price=False: accept
+        # empty Price; price_f=None for those rows so the web price is used.
         pending = []
         for row in range(2, ws.max_row + 1):
             seq = ws.cell(row, 1).value
@@ -101,17 +107,20 @@ def process_excel(xlsx_path: Path) -> None:
             price_val = ws.cell(row, 3).value
             date_val = ws.cell(row, 4).value
             status_val = ws.cell(row, 5).value
-            if (url and seq is not None and price_val not in (None, "")
-                    and not date_val and not status_val):
+            if not (url and seq is not None and not date_val and not status_val):
+                continue
+            if price_val in (None, ""):
+                if gate_price:
+                    continue
+                price_f = None  # use web-scraped price
+            else:
                 try:
                     price_f = float(price_val)
                 except (TypeError, ValueError):
-                    price_f = None
-                if price_f is None:
                     logger.info("    seq %s → skip (Price '%s' not numeric)",
                                 seq, price_val)
                     continue
-                pending.append((row, int(seq), str(url).strip(), price_f))
+            pending.append((row, int(seq), str(url).strip(), price_f))
 
         if not pending:
             logger.info("  No pending rows in '%s'", store)
@@ -223,6 +232,9 @@ def main():
         description="Excel-based Shein scraper pipeline (澳洲站)")
     parser.add_argument("file", nargs="?", default=None,
                         help="Path to .xlsx file (default: 处理 SUBMITTED_DIR 下所有 .xlsx)")
+    parser.add_argument("--no-price-gate", action="store_true",
+                        help="处理 C 列 Price 为空的行(用网页价,不做覆盖);"
+                             "默认要求 Price 填写才跑")
     args = parser.parse_args()
 
     setup_logging()
@@ -246,7 +258,7 @@ def main():
     for f in files:
         logger.info("=" * 60)
         try:
-            process_excel(f)
+            process_excel(f, gate_price=not args.no_price_gate)
         except Exception as e:
             logger.exception("Fatal error processing %s: %s", f.name, e)
 
