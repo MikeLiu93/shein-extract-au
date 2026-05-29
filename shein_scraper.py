@@ -66,7 +66,7 @@ from openpyxl.utils.cell import coordinate_to_tuple
 DEFAULT_SHIPPING_FEE   = float(os.environ.get("SHEIN_AU_SHIPPING_FEE", "7.95"))
 # eBay 价格公式：Price × MARKUP + Shipping（无最低 subtotal、无 max() 兜底）。
 EBAY_MARKUP            = float(os.environ.get("SHEIN_EBAY_MARKUP", "2.0"))
-CDP_PORT               = 9222
+CDP_PORT               = 9223
 PAGE_LOAD_MIN_WAIT     = 3        # 最少等待秒数（让 JS 初始化）
 PAGE_LOAD_MAX_WAIT     = 20       # 最多等待秒数（轮询 goods_sn）
 PAGE_LOAD_POLL_INTERVAL = 0.5     # 轮询间隔秒数
@@ -86,7 +86,7 @@ EXTRACTION_TIMEOUT_SEC = 60       # 单个页面提取超时（秒），正常3-
 RATE_LIMIT_CONSECUTIVE  = 3       # 连续失败 N 次视为限流，停止当前批次
 PICTURE_MAX_HEIGHT_PX  = 168
 KEEP_CHROME_OPEN       = True
-PERSISTENT_PROFILE_DIR = os.path.join(os.path.expanduser("~"), "shein-cdp-profile")
+PERSISTENT_PROFILE_DIR = os.path.join(os.path.expanduser("~"), "shein-cdp-profile-au")
 OUTPUT_ENCODING        = "utf-8"
 MEDIA_FOLDER_PREFIX    = "图片-"
 EBAY_LISTING_TXT_NAME  = "eBay上架描述.txt"
