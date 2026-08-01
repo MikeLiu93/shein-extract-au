@@ -53,7 +53,7 @@ def _sheet_matches_template(ws) -> bool:
     return str(ws.cell(1, COL_URL).value or "").strip() == "链接"
 
 
-def _read_pending_rows(ws) -> list:
+def _read_pending_rows(ws) -> list[dict]:
     """Return [{row, seq, url, price, shipping, variant_filter}, ...] for
     rows that have 链接 filled and 日期/状态 both empty. Non-template sheets
     return []. Empty 原价/运费 come through as None (scraper fallback)."""
@@ -82,10 +82,15 @@ def _read_pending_rows(ws) -> list:
         except (TypeError, ValueError):
             logger.info("  row %d: skip (运费 '%s' not numeric)", r, raw_ship)
             continue
+        try:
+            seq_int = int(seq)
+        except (TypeError, ValueError):
+            logger.info("  row %d: skip (编号 '%s' not numeric)", r, seq)
+            continue
         variant_filter = str(ws.cell(r, COL_VARIANT_FILTER).value or "").strip()
         pending.append({
             "row": r,
-            "seq": int(seq),
+            "seq": seq_int,
             "url": str(url).strip(),
             "price": price,
             "shipping": shipping,

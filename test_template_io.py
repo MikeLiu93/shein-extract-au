@@ -112,6 +112,18 @@ def test_write_only_date_status_on_failure():
     assert ws.cell(2, 12).value is None
 
 
+def test_non_numeric_seq_is_skipped_not_crashed():
+    """Row with a non-numeric 编号 (e.g. someone typed a note there) must
+    log and skip, not raise ValueError."""
+    ws = _blank_ws([
+        ["oops", "http://u1", 10.0, 7.95, "", None, None, None, None, None, None, None],
+        [2,     "http://u2", 10.0, 7.95, "", None, None, None, None, None, None, None],
+    ])
+    pending = _read_pending_rows(ws)
+    # First row skipped, second row returned normally.
+    assert [p["seq"] for p in pending] == [2]
+
+
 if __name__ == "__main__":
     test_reads_only_rows_ready_and_not_done()
     test_blank_price_and_shipping_kept_as_none()
@@ -119,4 +131,5 @@ if __name__ == "__main__":
     test_rejects_non_template_sheet()
     test_write_populates_result_columns()
     test_write_only_date_status_on_failure()
+    test_non_numeric_seq_is_skipped_not_crashed()
     print("ALL PASS")
