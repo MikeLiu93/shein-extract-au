@@ -1502,7 +1502,7 @@ def _filter_variants_by_declaration(
             continue
         if not isinstance(vals, list):
             continue
-        keep = [v for v in vals if _norm(v) in all_declared]
+        keep = [v for v in vals if _norm(v) in all_declared_norm]
         if keep:
             filtered_vars[k] = keep
 

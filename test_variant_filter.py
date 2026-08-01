@@ -82,6 +82,40 @@ def test_zero_match_returns_empty_and_flags():
     assert set(unknown) >= {"Purple", "XXL"}
 
 
+def test_flat_variations_key_not_in_sku_attrs():
+    """Fallback path: a variations key that has no per-SKU attrs entry, but its
+    values overlap the declaration, should be kept in filtered_vars.
+
+    X1 only has a Color attr, so 'Material' is not in filtered_vars after the
+    kept-SKU loop. The fallback loop must look up 'Cotton' against
+    all_declared_norm.keys() to decide whether to keep it. The bug used the
+    undefined name `all_declared` instead of `all_declared_norm`, causing a
+    NameError on this path.
+    """
+    skus = [
+        {"sku_code": "X1", "attrs": {"Color": "Black"}, "sale_price": 5.0, "stock": 1},
+    ]
+    variations = {
+        "Color": ["Black", "Red"],
+        "Material": ["Cotton", "Wool"],
+    }
+    # Flat (no "/") declaration: X1 matches because "Black" is in its attrs.
+    # "Cotton" is declared so the Material fallback should keep it.
+    kept, vars_, unknown = _filter_variants_by_declaration(
+        "Black, Cotton", skus, variations
+    )
+    # X1 matches "Black".
+    assert [s["sku_code"] for s in kept] == ["X1"]
+    # Color rebuilt from X1's attrs.
+    assert vars_.get("Color") == ["Black"]
+    # Material has no per-SKU entry; fallback keeps "Cotton" (declared), drops "Wool".
+    assert vars_.get("Material") == ["Cotton"]
+    # "Cotton" was declared but never matched a SKU's attr directly, so it
+    # appears in unknown. The fallback still adds it to filtered_vars, but
+    # unknown is computed before the fallback loop runs.
+    assert unknown == ["Cotton"]
+
+
 if __name__ == "__main__":
     test_empty_declaration_returns_everything()
     test_two_groups_cartesian()
@@ -89,4 +123,5 @@ if __name__ == "__main__":
     test_case_and_whitespace_insensitive()
     test_unknown_value_but_partial_match()
     test_zero_match_returns_empty_and_flags()
+    test_flat_variations_key_not_in_sku_attrs()
     print("ALL PASS")
