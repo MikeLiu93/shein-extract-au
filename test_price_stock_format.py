@@ -5,33 +5,34 @@ from shein_scraper import _format_price_range, _format_stock_summary
 
 # ── _format_price_range ─────────────────────────────────────────────────────
 
-def test_empty_returns_empty_string():
-    assert _format_price_range([]) == ""
+def test_empty_returns_none():
+    assert _format_price_range([]) is None
 
 
-def test_single_price_no_range():
+def test_single_price_returns_numeric():
     skus = [{"sale_price": 9.99}]
-    assert _format_price_range(skus) == "$9.99"
+    assert _format_price_range(skus) == 9.99
 
 
-def test_all_same_price_no_range():
+def test_all_same_price_returns_numeric():
     skus = [{"sale_price": 9.99}, {"sale_price": 9.99}, {"sale_price": 9.99}]
-    assert _format_price_range(skus) == "$9.99"
+    assert _format_price_range(skus) == 9.99
 
 
-def test_differing_prices_range():
+def test_differing_prices_return_range_string_no_currency():
     skus = [{"sale_price": 9.99}, {"sale_price": 14.99}, {"sale_price": 12.50}]
-    assert _format_price_range(skus) == "$9.99–$14.99"
+    # En-dash U+2013, no '$' — user wants numeric where possible, plain range otherwise.
+    assert _format_price_range(skus) == "9.99–14.99"
 
 
 def test_ignores_none_prices():
     skus = [{"sale_price": None}, {"sale_price": 9.99}]
-    assert _format_price_range(skus) == "$9.99"
+    assert _format_price_range(skus) == 9.99
 
 
-def test_only_nones_returns_empty():
+def test_only_nones_returns_none():
     skus = [{"sale_price": None}, {"sale_price": None}]
-    assert _format_price_range(skus) == ""
+    assert _format_price_range(skus) is None
 
 
 # ── _format_stock_summary ───────────────────────────────────────────────────
@@ -72,12 +73,12 @@ def test_stock_missing_attrs_uses_sku_code():
 
 
 if __name__ == "__main__":
-    test_empty_returns_empty_string()
-    test_single_price_no_range()
-    test_all_same_price_no_range()
-    test_differing_prices_range()
+    test_empty_returns_none()
+    test_single_price_returns_numeric()
+    test_all_same_price_returns_numeric()
+    test_differing_prices_return_range_string_no_currency()
     test_ignores_none_prices()
-    test_only_nones_returns_empty()
+    test_only_nones_returns_none()
     test_stock_empty_returns_empty()
     test_stock_single_variant_no_prefix()
     test_stock_multi_variant_slash_separated()
