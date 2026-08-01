@@ -32,7 +32,21 @@ if defined CONDA_LIBBIN if exist "%CONDA_LIBBIN%" (
 
 echo.
 echo ============================================================
-echo  Step 1/2: PyInstaller - build SheinExtractAU.exe
+echo  Step 1/3: Generate key_store.py from .build_key.txt
+echo ============================================================
+if not exist .build_key.txt (
+    echo [ERROR] .build_key.txt not found. Create it with the raw API key.
+    exit /b 1
+)
+python make_key_store.py
+if errorlevel 1 (
+    echo [ERROR] make_key_store.py failed.
+    exit /b 1
+)
+
+echo.
+echo ============================================================
+echo  Step 2/3: PyInstaller - build SheinExtractAU.exe
 echo ============================================================
 if exist build rmdir /s /q build
 if exist dist\SheinExtractAU.exe del /q dist\SheinExtractAU.exe
@@ -50,7 +64,7 @@ if /i "%1"=="exe" (
 
 echo.
 echo ============================================================
-echo  Step 2/2: Inno Setup - wrap into installer
+echo  Step 3/3: Inno Setup - wrap into installer
 echo ============================================================
 where iscc >nul 2>nul
 if errorlevel 1 (

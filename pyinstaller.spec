@@ -51,6 +51,8 @@ a = Analysis(
         'update_check',
         'auth',
         'version',
+        # Optional — only present after make_key_store.py ran
+        'key_store',
     ],
     hookspath=[],
     hooksconfig={},
