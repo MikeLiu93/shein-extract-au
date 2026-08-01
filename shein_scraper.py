@@ -3018,6 +3018,7 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
                     _rate_limited = True
                     break
 
+            tripped_early = False
             with ThreadPoolExecutor(max_workers=batch_size) as ex:
                 futures = []
                 for i in range(batch_start, batch_end):
@@ -3038,7 +3039,27 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
                     records.append(rec)
                     _bump_progress(rec.get("url", ""))
                     if _record_result_for_rate_limit(rec.get("status") or "OK"):
+                        tripped_early = True
                         break
+
+            # If the rate-limit tripped mid-batch, drain any futures that
+            # completed after our break — their tabs are already closed and
+            # results are ready; we just need to collect them so those rows
+            # aren't silently dropped (up to MAX_PARALLEL_TABS - 1 records).
+            if tripped_early:
+                collected_seq = {r.get("seq_num") for r in records}
+                for fut in futures:
+                    if not fut.done():
+                        continue
+                    try:
+                        rec = fut.result()
+                    except Exception as e:
+                        rec = {"status": f"ERROR: {e}",
+                               "url": "<unknown>", "seq_num": None}
+                    if rec.get("seq_num") in collected_seq:
+                        continue
+                    records.append(rec)
+                    collected_seq.add(rec.get("seq_num"))
 
             # If limiter tripped mid-batch, mark all not-yet-scraped as RATE_LIMITED.
             with _rate_limit_lock:
