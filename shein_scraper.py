@@ -72,13 +72,11 @@ PAGE_LOAD_MAX_WAIT     = 20       # 最多等待秒数（轮询 goods_sn）
 PAGE_LOAD_POLL_INTERVAL = 0.5     # 轮询间隔秒数
 PAGE_LOAD_RETRIES      = 3        # 遇到错误页面的最大重试次数
 RELOAD_PAUSE_SEC       = 2
-# Inter-URL pacing (anti-rate-limit). Random jitter + occasional long pauses
-# look less robotic than a fixed delay.
-INTER_URL_DELAY_MIN    = 4        # 每个商品之间最短间隔（秒）
-INTER_URL_DELAY_MAX    = 12       # 每个商品之间最长间隔（秒）
-LONG_PAUSE_EVERY       = 18       # 每处理 N 个商品后插一段长歇
-LONG_PAUSE_MIN         = 30       # 长歇最短秒数
-LONG_PAUSE_MAX         = 90       # 长歇最长秒数
+# Fixed pause between URL batches. Under parallelism this is the gap between
+# batches of MAX_WORKERS, not between individual URLs. 3s was chosen after
+# discussion — enough for Chrome tab cleanup and image processing without
+# feeling artificial.
+INTER_URL_DELAY_SEC    = 3
 # OOPS retry backoff: Shein 软封禁经常返回 "Oops" 假页面，先退避重试再判 DELISTED
 OOPS_RETRY_BACKOFF_MIN = 30
 OOPS_RETRY_BACKOFF_MAX = 60
@@ -90,22 +88,16 @@ PERSISTENT_PROFILE_DIR = os.path.join(os.path.expanduser("~"), "shein-cdp-profil
 OUTPUT_ENCODING        = "utf-8"
 MEDIA_FOLDER_PREFIX    = "图片-"
 EBAY_LISTING_TXT_NAME  = "eBay上架描述.txt"
-IMAGE_DOWNLOAD_WORKERS = 8        # 并行下载线程数
+IMAGE_DOWNLOAD_WORKERS = 4        # 并行下载线程数（3并发×4=12 sockets 总量可控）
 LOW_STOCK_THRESHOLD    = 15       # stock <= 此值标记 [少货]
 
 
 def _inter_url_pause(i: int, total: int) -> None:
-    """Sleep between URLs. Skip after last. Random jitter + occasional long pause."""
+    """Sleep between URL batches. Skip after last item."""
     if i >= total:
         return
-    delay = random.uniform(INTER_URL_DELAY_MIN, INTER_URL_DELAY_MAX)
-    if i > 0 and i % LONG_PAUSE_EVERY == 0:
-        long_pause = random.uniform(LONG_PAUSE_MIN, LONG_PAUSE_MAX)
-        print(f"  [节奏] 已处理 {i} 条 — 长歇 {long_pause:.0f}s + 间隔 {delay:.1f}s")
-        time.sleep(long_pause + delay)
-    else:
-        print(f"  [节奏] 间隔 {delay:.1f}s")
-        time.sleep(delay)
+    print(f"  [节奏] 间隔 {INTER_URL_DELAY_SEC}s")
+    time.sleep(INTER_URL_DELAY_SEC)
 
 
 _CHROME_PATHS = [
