@@ -1508,6 +1508,57 @@ def _filter_variants_by_declaration(
     return kept, filtered_vars, unknown
 
 
+def _format_price_range(sku_prices: list) -> str:
+    """Return '$X.XX' if all SKU sale_prices are equal, else '$LOW–$HIGH'.
+    Uses an en-dash (U+2013). Ignores None prices. Returns '' if none valid."""
+    prices = []
+    for sp in sku_prices or []:
+        p = sp.get("sale_price")
+        if p is None:
+            continue
+        try:
+            prices.append(float(p))
+        except (TypeError, ValueError):
+            continue
+    if not prices:
+        return ""
+    lo, hi = min(prices), max(prices)
+    if lo == hi:
+        return f"${lo:.2f}"
+    return f"${lo:.2f}–${hi:.2f}"
+
+
+def _format_stock_summary(sku_prices: list) -> str:
+    """One-line stock summary for the L column ('库存').
+
+    Format: '<label>: <count>' entries joined by ' / '. Label is a hyphenated
+    join of attribute values in insertion order (e.g. 'Black-M'); when the
+    SKU has no attributes, sku_code is used. Count is 缺货 for 0, '少货 N'
+    for 1..LOW_STOCK_THRESHOLD, and the plain number above that. When there
+    is exactly one SKU with attribute values, the label is still emitted so
+    the operator can see which variant the stock refers to.
+    """
+    def _label(sp: dict) -> str:
+        vals = [str(v).strip() for v in (sp.get("attrs") or {}).values() if v]
+        if vals:
+            return "-".join(vals)
+        return str(sp.get("sku_code") or "").strip() or "?"
+
+    def _count(sp: dict) -> str:
+        try:
+            stk = int(sp.get("stock") or 0)
+        except (TypeError, ValueError):
+            stk = 0
+        if stk == 0:
+            return "缺货"
+        if stk <= LOW_STOCK_THRESHOLD:
+            return f"少货 {stk}"
+        return str(stk)
+
+    parts = [f"{_label(sp)}: {_count(sp)}" for sp in (sku_prices or [])]
+    return " / ".join(parts)
+
+
 # ── Image helpers ─────────────────────────────────────────────────────────────
 
 def _first_product_image_path(folder) -> "Path | None":
