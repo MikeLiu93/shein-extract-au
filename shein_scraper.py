@@ -1413,6 +1413,102 @@ def _split_variations_for_excel(variations: dict, sku_prices: list = None,
     return "\n".join(fmt_line(k) for k in keys), ""
 
 
+def _filter_variants_by_declaration(
+    declaration: str,
+    sku_prices: list,
+    variations: dict,
+) -> tuple[list, dict, list]:
+    """Restrict sku_prices + variations to variants declared by the user.
+
+    Grammar of `declaration`:
+      - Empty / whitespace → no filter; return inputs unchanged.
+      - No "/"             → flat allow-list; a SKU is kept if any of its
+                             attribute values matches (case/whitespace-insensitive).
+      - Contains "/"       → groups separated by "/", values within each group
+                             comma-separated. A SKU is kept only if EVERY
+                             non-empty group has at least one value equal to
+                             one of that SKU's attribute values.
+
+    Returns (kept_sku_prices, filtered_variations_dict, unknown_values_list).
+    `unknown_values_list` contains declared values that never matched any
+    scraped variant — caller logs a warning. When declaration was given
+    but nothing matched, kept is [] and filtered_variations is {}.
+    """
+    decl = (declaration or "").strip()
+    if not decl:
+        return sku_prices, variations, []
+
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+    groups = [
+        [_norm(v) for v in grp.split(",") if _norm(v)]
+        for grp in decl.split("/")
+    ]
+    groups = [g for g in groups if g]  # drop empty groups
+    if not groups:
+        return sku_prices, variations, []
+
+    # all_declared_norm maps normalized-value → original-user-casing for reporting
+    all_declared_norm: dict[str, str] = {}
+    for grp in decl.split("/"):
+        for v in grp.split(","):
+            n = _norm(v)
+            raw = v.strip()
+            if n:
+                all_declared_norm[n] = raw
+
+    seen_norm: set[str] = set()
+
+    def _sku_matches(sku: dict) -> bool:
+        attr_values = {_norm(v) for v in (sku.get("attrs") or {}).values() if v}
+        if len(groups) == 1:
+            # Flat allow-list: any attribute value overlaps the group.
+            hits = attr_values & set(groups[0])
+            seen_norm.update(hits)
+            return bool(hits)
+        # Multi-group: every group must overlap this SKU's attribute values.
+        ok = True
+        for g in groups:
+            hits = attr_values & set(g)
+            if not hits:
+                ok = False
+            else:
+                seen_norm.update(hits)
+        return ok
+
+    kept = [s for s in sku_prices if _sku_matches(s)]
+    unseen_norm = set(all_declared_norm.keys()) - seen_norm
+    unknown = sorted(all_declared_norm[n] for n in unseen_norm)
+
+    if not kept:
+        return [], {}, sorted(all_declared_norm[n] for n in all_declared_norm)
+
+    # Rebuild variations dict from kept SKUs so downstream (title, txt, L col)
+    # sees only declared values in original scraper casing.
+    filtered_vars: dict[str, list] = {}
+    for sp in kept:
+        for k, v in (sp.get("attrs") or {}).items():
+            if not v:
+                continue
+            filtered_vars.setdefault(k, [])
+            if v not in filtered_vars[k]:
+                filtered_vars[k].append(v)
+    # Preserve top-level variations keys that were flat (no per-SKU attrs) —
+    # rare but safe: keep any original key not covered by kept-SKU attrs, if
+    # its values overlap the declaration.
+    for k, vals in (variations or {}).items():
+        if k in filtered_vars:
+            continue
+        if not isinstance(vals, list):
+            continue
+        keep = [v for v in vals if _norm(v) in all_declared]
+        if keep:
+            filtered_vars[k] = keep
+
+    return kept, filtered_vars, unknown
+
+
 # ── Image helpers ─────────────────────────────────────────────────────────────
 
 def _first_product_image_path(folder) -> "Path | None":
