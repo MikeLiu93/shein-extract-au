@@ -116,6 +116,22 @@ def test_flat_variations_key_not_in_sku_attrs():
     assert unknown == ["Cotton"]
 
 
+def test_multi_group_seen_leak_reports_unreachable_value():
+    """Bug repro: 'Red' declared, but no Red row survives the size filter →
+    'Red' MUST appear in unknown so the operator knows it's unreachable."""
+    skus = [
+        _make_sku("A1", "Black", "M",  9.99, 12),
+        _make_sku("A2", "Red",   "XL", 10.99, 3),
+    ]
+    variations = {"Color": ["Black", "Red"], "Size": ["M", "L", "XL"]}
+    kept, vars_, unknown = _filter_variants_by_declaration(
+        "Black, Red / M, L", skus, variations
+    )
+    assert [s["sku_code"] for s in kept] == ["A1"]
+    assert "Red" in unknown, f"expected 'Red' unreachable warning; got unknown={unknown}"
+    assert "XL" not in unknown, f"XL wasn't declared; got unknown={unknown}"
+
+
 if __name__ == "__main__":
     test_empty_declaration_returns_everything()
     test_two_groups_cartesian()
@@ -124,4 +140,5 @@ if __name__ == "__main__":
     test_unknown_value_but_partial_match()
     test_zero_match_returns_empty_and_flags()
     test_flat_variations_key_not_in_sku_attrs()
+    test_multi_group_seen_leak_reports_unreachable_value()
     print("ALL PASS")

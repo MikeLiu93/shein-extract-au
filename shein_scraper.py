@@ -1458,26 +1458,25 @@ def _filter_variants_by_declaration(
             if n:
                 all_declared_norm[n] = raw
 
-    seen_norm: set[str] = set()
-
     def _sku_matches(sku: dict) -> bool:
         attr_values = {_norm(v) for v in (sku.get("attrs") or {}).values() if v}
         if len(groups) == 1:
             # Flat allow-list: any attribute value overlaps the group.
-            hits = attr_values & set(groups[0])
-            seen_norm.update(hits)
-            return bool(hits)
+            return bool(attr_values & set(groups[0]))
         # Multi-group: every group must overlap this SKU's attribute values.
-        ok = True
-        for g in groups:
-            hits = attr_values & set(g)
-            if not hits:
-                ok = False
-            else:
-                seen_norm.update(hits)
-        return ok
+        return all(bool(attr_values & set(g)) for g in groups)
 
     kept = [s for s in sku_prices if _sku_matches(s)]
+
+    # Compute seen_norm from kept SKUs only (not from failed candidates) so
+    # declared values that appeared in rejected SKUs are still reported as unknown.
+    seen_norm: set[str] = set()
+    for sp in kept:
+        for v in (sp.get("attrs") or {}).values():
+            n = _norm(v)
+            if n in all_declared_norm:
+                seen_norm.add(n)
+
     unseen_norm = set(all_declared_norm.keys()) - seen_norm
     unknown = sorted(all_declared_norm[n] for n in unseen_norm)
 
