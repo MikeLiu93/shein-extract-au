@@ -2661,7 +2661,7 @@ def _download_media(rec: dict, base_dir: "Path", seq_num: "int | None" = None) -
 # ── Public function ───────────────────────────────────────────────────────────
 
 def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
-                 price_list=None):
+                 price_list=None, shipping_list=None, variant_filter_list=None):
     """
     抓取一个或多个 Shein 商品 URL，保存到 Excel。
 
@@ -2674,6 +2674,11 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
     price_list : list[float|None] | None  每个 URL 对应的手动售价（USD）；非 None
                  则覆盖网页爬取的 sale_price，并据此重算 shipping/eBay price。
                  网页原始售价仍会回传到记录的 web_price 字段（写入 Excel H 列）。
+    shipping_list        : list[float|None] | None
+                           每个 URL 对应的手动运费。非 None 时覆盖扫描运费。
+    variant_filter_list  : list[str] | None
+                           每个 URL 对应的变体过滤声明（模板 E 列）。
+                           空串或 None 表示不过滤。
     """
     if isinstance(urls, str):
         urls = [urls]
@@ -2838,6 +2843,26 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
                 data["variations"] = _merge_main_sale_attr_colors(
                     data.get("variations") or {}, data.get("main_sale_attrs") or [])
 
+                # Variant filter: E-column declaration restricts sku_prices + variations.
+                vf_decl = (variant_filter_list[i - 1] if variant_filter_list else "")
+                if vf_decl:
+                    _kept, _filt_vars, _unknown = _filter_variants_by_declaration(
+                        vf_decl, data.get("sku_prices") or [], data.get("variations") or {}
+                    )
+                    if _unknown:
+                        print(f"  [变体过滤] 声明中未匹配到: {_unknown}")
+                    if not _kept and (data.get("sku_prices") or []):
+                        # Zero matches on a product that DID have variants — mark failed.
+                        rec["status"] = f"ERROR: variant_filter_no_match ({vf_decl!r})"
+                        records.append(rec)
+                        if tab_id is not None:
+                            _close_tab(CDP_PORT, tab_id)
+                        _inter_url_pause(i, len(urls))
+                        continue
+                    data["sku_prices"] = _kept
+                    if _filt_vars:
+                        data["variations"] = _filt_vars
+
                 # 网页爬到的原始售价（覆盖前），回传到 web_price 写入 Excel H 列
                 web_price = data.get("price")
                 # 手动售价覆盖：C 列价格替代网页 sale_price（用户填写更可靠）。
@@ -2853,29 +2878,41 @@ def scrape_shein(urls, output="shein_products.xlsx", start_seq=1, seq_list=None,
                           f"(网页=${(web_price or 0):.2f}, "
                           f"sku_prices×{len(data.get('sku_prices') or [])} 同步)")
 
-                shipping = _calc_shipping(data)
-                price    = data.get("price") or 0.0
-                ebay     = _ebay_listing_price(price, shipping)
-                thresh   = data.get("free_threshold")
-                if data.get("unconditional_free"):
-                    ship_note = "unconditional FREE shipping"
-                elif thresh is not None:
-                    ship_note = (
-                        f"threshold AU${thresh:.2f} — price AU${price:.2f} "
-                        + ("≥ threshold → FREE" if price >= thresh
-                           else f"< threshold → AU${DEFAULT_SHIPPING_FEE}")
-                    )
-                elif not (data.get("shipping_raw") or "").strip():
-                    ship_note = "no shipping info on page → assumed FREE"
+                # Shipping override: template D column wins over scraped shipping.
+                override_shipping = (shipping_list[i - 1] if shipping_list else None)
+                if override_shipping is not None:
+                    shipping = float(override_shipping)
+                    ship_note = f"template D=${shipping:.2f} (override)"
                 else:
-                    ship_note = f"shipping text present but no threshold → AU${DEFAULT_SHIPPING_FEE}"
+                    shipping = _calc_shipping(data)
+                    ship_note = None  # will be filled in below if not set here
+                price = data.get("price") or 0.0
+                ebay  = _ebay_listing_price(price, shipping)
+                thresh = data.get("free_threshold")
+                if ship_note is None:
+                    if data.get("unconditional_free"):
+                        ship_note = "unconditional FREE shipping"
+                    elif thresh is not None:
+                        ship_note = (
+                            f"threshold AU${thresh:.2f} — price AU${price:.2f} "
+                            + ("≥ threshold → FREE" if price >= thresh
+                               else f"< threshold → AU${DEFAULT_SHIPPING_FEE}")
+                        )
+                    elif not (data.get("shipping_raw") or "").strip():
+                        ship_note = "no shipping info on page → assumed FREE"
+                    else:
+                        ship_note = f"shipping text present but no threshold → AU${DEFAULT_SHIPPING_FEE}"
 
                 sku_prices = data.get("sku_prices") or []
                 rec.update({
-                    "sku":            data.get("goods_sn") or data.get("goods_id", ""),
-                    "price":          price,
-                    "web_price":      web_price,
-                    "shipping":       shipping,
+                    "sku":               data.get("goods_sn") or data.get("goods_id", ""),
+                    "price":             price,
+                    "web_price":         web_price,
+                    "web_price_display": _format_price_range(sku_prices) or (
+                                          f"${float(web_price):.2f}"
+                                          if web_price is not None else ""),
+                    "stock_summary":     _format_stock_summary(sku_prices),
+                    "shipping":          shipping,
                     "shipping_raw":   data.get("shipping_raw") or "",
                     "free_threshold": data.get("free_threshold"),
                     "unconditional_free": data.get("unconditional_free", False),
