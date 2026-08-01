@@ -37,6 +37,86 @@ from config import SUBMITTED_DIR, OUTPUT_ROOT_2ND as OUTPUT_ROOT, INPUT_FILENAME
 logger = logging.getLogger("run_excel")
 DEBUG_LOG_DIR = Path(__file__).resolve().parent / "debug_logs"
 
+# ── New Chinese-header template schema ────────────────────────────────────────
+# Cols A–L. See docs/superpowers/specs/2026-08-01-au-template-refactor-design.md §1.
+COL_SEQ, COL_URL, COL_PRICE, COL_SHIPPING, COL_VARIANT_FILTER = 1, 2, 3, 4, 5
+COL_DATE, COL_STATUS, COL_WEB_PRICE, COL_SHEIN_TITLE = 6, 7, 8, 9
+COL_EBAY_TITLE, COL_EBAY_PRICE, COL_STOCK = 10, 11, 12
+
+EXPECTED_HEADERS = ["编号", "链接", "原价", "运费", "变体",
+                    "日期", "状态", "希音价格", "希音标题",
+                    "eBay标题", "eBay价格", "库存"]
+
+
+def _sheet_matches_template(ws) -> bool:
+    """The sheet must have '链接' in col B row 1 to be treated as the new schema."""
+    return str(ws.cell(1, COL_URL).value or "").strip() == "链接"
+
+
+def _read_pending_rows(ws) -> list:
+    """Return [{row, seq, url, price, shipping, variant_filter}, ...] for
+    rows that have 链接 filled and 日期/状态 both empty. Non-template sheets
+    return []. Empty 原价/运费 come through as None (scraper fallback)."""
+    if not _sheet_matches_template(ws):
+        return []
+    pending = []
+    for r in range(2, ws.max_row + 1):
+        seq = ws.cell(r, COL_SEQ).value
+        url = ws.cell(r, COL_URL).value
+        date_v = ws.cell(r, COL_DATE).value
+        status_v = ws.cell(r, COL_STATUS).value
+        if not url or date_v or status_v:
+            continue
+        if seq is None:
+            logger.info("  row %d: skip (no 编号)", r)
+            continue
+        raw_price = ws.cell(r, COL_PRICE).value
+        raw_ship = ws.cell(r, COL_SHIPPING).value
+        try:
+            price = float(raw_price) if raw_price not in (None, "") else None
+        except (TypeError, ValueError):
+            logger.info("  row %d: skip (原价 '%s' not numeric)", r, raw_price)
+            continue
+        try:
+            shipping = float(raw_ship) if raw_ship not in (None, "") else None
+        except (TypeError, ValueError):
+            logger.info("  row %d: skip (运费 '%s' not numeric)", r, raw_ship)
+            continue
+        variant_filter = str(ws.cell(r, COL_VARIANT_FILTER).value or "").strip()
+        pending.append({
+            "row": r,
+            "seq": int(seq),
+            "url": str(url).strip(),
+            "price": price,
+            "shipping": shipping,
+            "variant_filter": variant_filter,
+        })
+    return pending
+
+
+def _write_result_row(
+    ws, row: int, date: str, status: str,
+    web_price=None,
+    shein_title=None,
+    ebay_title=None,
+    ebay_price=None,
+    stock=None,
+) -> None:
+    """Write result columns F–L. Optional cols default to None (skip write).
+    Always writes 日期 (F) and 状态 (G)."""
+    ws.cell(row, COL_DATE).value = date
+    ws.cell(row, COL_STATUS).value = status
+    if web_price is not None:
+        ws.cell(row, COL_WEB_PRICE).value = web_price
+    if shein_title is not None:
+        ws.cell(row, COL_SHEIN_TITLE).value = shein_title
+    if ebay_title is not None:
+        ws.cell(row, COL_EBAY_TITLE).value = ebay_title
+    if ebay_price is not None:
+        ws.cell(row, COL_EBAY_PRICE).value = ebay_price
+    if stock is not None:
+        ws.cell(row, COL_STOCK).value = stock
+
 
 def setup_logging():
     DEBUG_LOG_DIR.mkdir(parents=True, exist_ok=True)
