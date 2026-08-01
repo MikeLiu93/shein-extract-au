@@ -1535,9 +1535,12 @@ def _filter_variants_by_declaration(
     return kept, filtered_vars, unknown
 
 
-def _format_price_range(sku_prices: list) -> str:
-    """Return '$X.XX' if all SKU sale_prices are equal, else '$LOW–$HIGH'.
-    Uses an en-dash (U+2013). Ignores None prices. Returns '' if none valid."""
+def _format_price_range(sku_prices: list):
+    """Return a numeric price when all SKU sale_prices are equal, a string
+    range 'LO–HI' (en-dash U+2013, no currency symbol) when they differ, and
+    None when no valid price exists. Numeric return lets Excel treat the H
+    column as a number; a range must stay string since it isn't one value.
+    Ignores None prices."""
     prices = []
     for sp in sku_prices or []:
         p = sp.get("sale_price")
@@ -1548,11 +1551,11 @@ def _format_price_range(sku_prices: list) -> str:
         except (TypeError, ValueError):
             continue
     if not prices:
-        return ""
+        return None
     lo, hi = min(prices), max(prices)
     if lo == hi:
-        return f"${lo:.2f}"
-    return f"${lo:.2f}–${hi:.2f}"
+        return round(lo, 2)
+    return f"{lo:.2f}–{hi:.2f}"
 
 
 def _format_stock_summary(sku_prices: list) -> str:
@@ -2853,13 +2856,14 @@ def _scrape_one_url(
                 ship_note = f"shipping text present but no threshold → AU${DEFAULT_SHIPPING_FEE}"
 
         sku_prices = data.get("sku_prices") or []
+        _wp_disp = _format_price_range(sku_prices)
+        if _wp_disp is None and web_price is not None:
+            _wp_disp = round(float(web_price), 2)
         rec.update({
             "sku":              data.get("goods_sn") or data.get("goods_id", ""),
             "price":            price,
             "web_price":        web_price,
-            "web_price_display": _format_price_range(sku_prices) or (
-                                  f"${float(web_price):.2f}"
-                                  if web_price is not None else ""),
+            "web_price_display": _wp_disp,
             "stock_summary":    _format_stock_summary(sku_prices),
             "shipping":         shipping,
             "shipping_raw":     data.get("shipping_raw") or "",

@@ -15,11 +15,13 @@ Columns (strict, Chinese-header template schema):
     E: 变体       — variant filter declaration. READ. Blank → scrape all.
     F: 日期       — run date. WRITE.
     G: 状态       — Done / Failed / Delisted. WRITE.
-    H: 希音价格   — scraped price (single value or range like "$9.99–$14.99"). WRITE.
-    I: 希音标题   — raw scraped h1 title. WRITE.
-    J: eBay 标题  — AI-generated (Haiku, fallback to rule). WRITE.
-    K: eBay 价格  — (C or scraped) × 2 + (D or scraped). WRITE.
-    L: 库存       — one-line variant stock summary. WRITE.
+    H: 图片       — embedded first product image (scaled). WRITE.
+    I: 希音价格   — scraped price. Single value → numeric; multi-variant with
+                    differing prices → string range "9.99–14.99". WRITE.
+    J: 希音标题   — raw scraped h1 title. WRITE.
+    K: eBay 标题  — AI-generated (Haiku, fallback to rule). WRITE.
+    L: eBay 价格  — (C or scraped) × 2 + (D or scraped). WRITE.
+    M: 库存       — one-line variant stock summary. WRITE.
 
 Only rows where 链接 is filled AND 日期/状态 are both empty are processed.
 Non-template sheets (missing '链接' in B1) are skipped.
@@ -36,20 +38,22 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from shein_scraper import scrape_shein, RateLimitError
+from shein_scraper import scrape_shein, RateLimitError, _add_picture_to_cell
 from config import SUBMITTED_DIR, OUTPUT_ROOT_2ND as OUTPUT_ROOT, INPUT_FILENAME
 
 logger = logging.getLogger("run_excel")
 DEBUG_LOG_DIR = Path(__file__).resolve().parent / "debug_logs"
 
 # ── New Chinese-header template schema ────────────────────────────────────────
-# Cols A–L. See docs/superpowers/specs/2026-08-01-au-template-refactor-design.md §1.
+# Cols A–M. See docs/superpowers/specs/2026-08-01-au-template-refactor-design.md §1.
+# 2026-08-02: column H "图片" added (embedded product image); prices+titles shifted +1.
 COL_SEQ, COL_URL, COL_PRICE, COL_SHIPPING, COL_VARIANT_FILTER = 1, 2, 3, 4, 5
-COL_DATE, COL_STATUS, COL_WEB_PRICE, COL_SHEIN_TITLE = 6, 7, 8, 9
-COL_EBAY_TITLE, COL_EBAY_PRICE, COL_STOCK = 10, 11, 12
+COL_DATE, COL_STATUS, COL_PICTURE = 6, 7, 8
+COL_WEB_PRICE, COL_SHEIN_TITLE = 9, 10
+COL_EBAY_TITLE, COL_EBAY_PRICE, COL_STOCK = 11, 12, 13
 
 EXPECTED_HEADERS = ["编号", "链接", "原价", "运费", "变体",
-                    "日期", "状态", "希音价格", "希音标题",
+                    "日期", "状态", "图片", "希音价格", "希音标题",
                     "eBay标题", "eBay价格", "库存"]
 
 
@@ -106,16 +110,23 @@ def _read_pending_rows(ws) -> list[dict]:
 
 def _write_result_row(
     ws, row: int, date: str, status: str,
+    picture_path=None,
     web_price=None,
     shein_title=None,
     ebay_title=None,
     ebay_price=None,
     stock=None,
 ) -> None:
-    """Write result columns F–L. Optional cols default to None (skip write).
-    Always writes 日期 (F) and 状态 (G)."""
+    """Write result columns F–M. Optional cols default to None (skip write).
+    Always writes 日期 (F) and 状态 (G). When picture_path is a real file,
+    embeds the image in H and grows the row height to fit."""
     ws.cell(row, COL_DATE).value = date
     ws.cell(row, COL_STATUS).value = status
+    if picture_path and Path(picture_path).is_file():
+        row_h = _add_picture_to_cell(ws, row, COL_PICTURE, Path(picture_path))
+        if row_h:
+            existing = ws.row_dimensions[row].height or 0
+            ws.row_dimensions[row].height = max(existing, row_h)
     if web_price is not None:
         ws.cell(row, COL_WEB_PRICE).value = web_price
     if shein_title is not None:
@@ -244,6 +255,7 @@ def process_excel(xlsx_path: Path) -> None:
                 _write_result_row(
                     ws, row=row,
                     date=today, status="Done",
+                    picture_path=rec.get("first_image_path") or None,
                     web_price=rec.get("web_price_display"),
                     shein_title=rec.get("original_title") or rec.get("title"),
                     ebay_title=rec.get("ebay_title"),
