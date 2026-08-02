@@ -67,3 +67,41 @@ def _parse_postage(s) -> "float | None":
     if re.search(r"\bfree\s+(postage|shipping|delivery)\b", t, re.I):
         return 0.0
     return _parse_price(t)  # reuse the price extractor for the numeric part
+
+
+@dataclass
+class EbayHit:
+    title: str
+    sticker_price: float
+    postage: "float | None"  # None → couldn't parse; delivered falls back to sticker
+    delivered_price: float
+    url: str
+    image_url: str
+
+
+def _extract_from_page(raw_hits: list) -> "list[EbayHit]":
+    """Convert the JS-extracted raw hits into normalized EbayHit list.
+    Drops entries without a parseable sticker price. Returns at most 2
+    (Best Match rank 1 and rank 2). URL cleaned, postage-fail falls back
+    to sticker for delivered."""
+    out: list[EbayHit] = []
+    for raw in raw_hits or []:
+        if len(out) >= 2:
+            break
+        sticker = _parse_price(str(raw.get("price") or ""))
+        if sticker is None:
+            continue  # can't rank without a price
+        postage = _parse_postage(str(raw.get("postage") or ""))
+        delivered = sticker + (postage if postage is not None else 0.0)
+        # If postage was truly missing (None), delivered = sticker only.
+        if postage is None:
+            delivered = sticker
+        out.append(EbayHit(
+            title=str(raw.get("title") or "").strip(),
+            sticker_price=sticker,
+            postage=postage,
+            delivered_price=round(delivered, 2),
+            url=_clean_ebay_url(str(raw.get("url") or "")),
+            image_url=str(raw.get("image_url") or "").strip(),
+        ))
+    return out
