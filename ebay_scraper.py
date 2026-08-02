@@ -27,8 +27,11 @@ def _clean_ebay_url(u: str) -> str:
     return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
 
 
-# Matches "12.99", "1,234.99", "50" — captures the numeric literal.
-_PRICE_NUM_RE = re.compile(r"(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)")
+# Matches "12.99", "1,234.99", "50", "1234567.99" — a digit run possibly
+# containing commas, optionally with a decimal. Comma placement isn't
+# validated (we strip commas before float()); focus is defensive
+# extraction, not format conformance.
+_PRICE_NUM_RE = re.compile(r"(\d[\d,]*(?:\.\d{1,2})?)")
 
 
 def _parse_price(s) -> "float | None":

@@ -67,6 +67,12 @@ def test_postage_unparseable_returns_none():
     assert _parse_postage("Contact seller for postage") is None
 
 
+def test_price_unformatted_large_number():
+    # Regression: no commas, 4+ digits — must not silently truncate.
+    assert _parse_price("$1234567.99") == 1234567.99
+    assert _parse_price("AU $9999") == 9999.0
+
+
 if __name__ == "__main__":
     test_price_au_prefix()
     test_price_bare_dollar()
@@ -76,6 +82,7 @@ if __name__ == "__main__":
     test_price_whitespace_tolerant()
     test_price_empty_returns_none()
     test_price_gibberish_returns_none()
+    test_price_unformatted_large_number()
     test_postage_free()
     test_postage_free_case_insensitive()
     test_postage_plus_prefix()
