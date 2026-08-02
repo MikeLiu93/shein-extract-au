@@ -25,3 +25,42 @@ def _clean_ebay_url(u: str) -> str:
         return u
     # Drop query + fragment; keep scheme, host, path.
     return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+
+
+# Matches "12.99", "1,234.99", "50" — captures the numeric literal.
+_PRICE_NUM_RE = re.compile(r"(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)")
+
+
+def _parse_price(s) -> "float | None":
+    """Parse an eBay AU sticker price string into a float.
+    Handles 'AU $12.99', '$12.99', 'AU $1,234.99', integer prices, ranges
+    ('AU $X to AU $Y' → take X), whitespace. Returns None for None / empty
+    / no numeric substring."""
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        return None
+    t = s.strip()
+    if not t:
+        return None
+    m = _PRICE_NUM_RE.search(t)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_postage(s) -> "float | None":
+    """Parse eBay postage cell text. 'Free postage' / 'Free shipping' → 0.0.
+    '+ AU $6.95 postage' / 'AU $6.95 postage' → 6.95. Returns None if
+    unparseable or empty."""
+    if s is None or not isinstance(s, str):
+        return None
+    t = s.strip()
+    if not t:
+        return None
+    if re.search(r"\bfree\s+(postage|shipping|delivery)\b", t, re.I):
+        return 0.0
+    return _parse_price(t)  # reuse the price extractor for the numeric part
