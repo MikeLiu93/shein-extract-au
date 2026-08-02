@@ -95,26 +95,20 @@ def _write_ebay_result(
         ws.cell(row, COL_HIGH_URL).value = high_url
 
 
-import os
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from shein_scraper import (
     CDP_PORT,
     MAX_PARALLEL_TABS,
-    INTER_URL_DELAY_SEC,
     RateLimitError,
     _ensure_chrome,
     _inter_url_pause,
     _rate_limit_lock,
     _record_result_for_rate_limit,
     _reset_rate_limit_state,
-    _screenshots_dir,
-    _take_screenshot,
-    _ws_url_for_id,
 )
-from notify import alert_captcha, alert_generic
+from notify import alert_captcha
 from ebay_scraper import search_ebay_au, _ensure_ebay_session
 from config import SUBMITTED_DIR, INPUT_FILENAME
 
@@ -183,6 +177,10 @@ def _check_one_row(pending_row: dict, port: int) -> dict:
             result["status"] = "captcha"
             result["error"] = msg
             print(f"  CAPTCHA: {msg}")
+            try:
+                alert_captcha(f"eBay AU search: {query[:60]}")
+            except Exception:
+                pass
         else:
             result["error"] = msg
             print(f"  ERROR: {msg}")
@@ -254,6 +252,7 @@ def process_excel(xlsx_path: Path) -> None:
                     for i in range(batch_start, batch_end)
                 ]
                 tripped_early = False
+                applied = set()  # future ids that have been applied
                 for fut in as_completed(futures):
                     try:
                         result = fut.result()
@@ -261,20 +260,22 @@ def process_excel(xlsx_path: Path) -> None:
                         result = {"row": -1, "seq": None, "status": "error",
                                   "hits": [], "error": str(e)}
                     _apply_result_to_row(ws, result, today, ws_lock)
+                    applied.add(id(fut))
                     if _record_result_for_rate_limit(
                         "OK" if result["status"] in ("ok", "no_match") else "FAIL"
                     ):
                         tripped_early = True
                         break
-                # Drain completed-but-uncollected futures.
+                # Drain futures that completed AFTER we broke, but weren't applied yet.
                 if tripped_early:
                     for fut in futures:
-                        if fut.done():
-                            try:
-                                result = fut.result()
-                                _apply_result_to_row(ws, result, today, ws_lock)
-                            except Exception:
-                                pass
+                        if id(fut) in applied or not fut.done():
+                            continue
+                        try:
+                            result = fut.result()
+                            _apply_result_to_row(ws, result, today, ws_lock)
+                        except Exception:
+                            pass
                     rate_limited = True
 
             if batch_end < total and not rate_limited:
