@@ -145,7 +145,12 @@ _JS_EBAY_SEARCH_EXTRACT = r"""
         }
         if (out.length >= 5) break;  // grab a small pool; extractor keeps top 2
     }
-    return out;
+    // Signal whether the SRP shell has rendered (page loaded, ready to inspect).
+    // If the shell is absent, caller treats this as a timeout, not a genuine 0-result.
+    var loaded = !!document.querySelector(
+        '#srp-river-results, .srp-results, .srp-controls, [class*="srp-list"]'
+    );
+    return {loaded: loaded, hits: out};
 })()
 """
 
@@ -212,6 +217,7 @@ def search_ebay_au(query: str, port: int = CDP_PORT) -> "list[EbayHit]":
         deadline = time.monotonic() + 10.0
         time.sleep(2)
         raw_hits = []
+        page_loaded = False
         while time.monotonic() < deadline:
             ws_url = _ws_url_for_id(port, tab_id)
             # Captcha check
@@ -224,12 +230,21 @@ def search_ebay_au(query: str, port: int = CDP_PORT) -> "list[EbayHit]":
             except Exception:
                 pass
             try:
-                raw_hits = _run_js(ws_url, _JS_EBAY_SEARCH_EXTRACT) or []
-                if raw_hits:
-                    break
+                result = _run_js(ws_url, _JS_EBAY_SEARCH_EXTRACT) or {}
+                if isinstance(result, dict):
+                    page_loaded = page_loaded or bool(result.get("loaded"))
+                    raw_hits = result.get("hits") or []
+                    if raw_hits:
+                        break
+                    if page_loaded:
+                        # Page rendered but no hits — genuine 0-result. Stop polling.
+                        break
             except Exception:
                 pass
             time.sleep(1.0)
+        if not page_loaded and not raw_hits:
+            # SRP shell never rendered — treat as timeout (retryable, not "no match").
+            raise RuntimeError("eBay search timeout: SRP shell never rendered")
         return _extract_from_page(raw_hits)
     finally:
         _close_tab(port, tab_id)
