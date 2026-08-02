@@ -93,3 +93,236 @@ def _write_ebay_result(
         ws.cell(row, COL_HIGH_PRICE).value = high_price
     if high_url:
         ws.cell(row, COL_HIGH_URL).value = high_url
+
+
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from shein_scraper import (
+    CDP_PORT,
+    MAX_PARALLEL_TABS,
+    INTER_URL_DELAY_SEC,
+    RateLimitError,
+    _ensure_chrome,
+    _inter_url_pause,
+    _rate_limit_lock,
+    _record_result_for_rate_limit,
+    _reset_rate_limit_state,
+    _screenshots_dir,
+    _take_screenshot,
+    _ws_url_for_id,
+)
+from notify import alert_captcha, alert_generic
+from ebay_scraper import search_ebay_au, _ensure_ebay_session
+from config import SUBMITTED_DIR, INPUT_FILENAME
+
+
+def setup_logging():
+    DEBUG_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = DEBUG_LOG_DIR / f"ebay_{ts}.log"
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    root = logging.getLogger("ebay_price_check")
+    root.handlers.clear()
+    root.setLevel(logging.DEBUG)
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+
+    logger.info("Log: %s", log_path)
+    return log_path
+
+
+def safe_save(wb, xlsx_path: Path) -> None:
+    """Save workbook. If locked by another user, save as copy with '2' suffix."""
+    try:
+        wb.save(xlsx_path)
+    except PermissionError:
+        alt = xlsx_path.with_stem(xlsx_path.stem + "2")
+        logger.warning("Cannot save to %s (locked), saving to %s", xlsx_path.name, alt.name)
+        wb.save(alt)
+        logger.info("Saved to alternate: %s", alt.name)
+
+
+def _check_one_row(pending_row: dict, port: int) -> dict:
+    """Worker: search eBay for one pending row. Returns a result dict with:
+      status: 'ok' | 'no_match' | 'captcha' | 'error'
+      hits: list[EbayHit] (may be empty)
+      row: int (original row for write-back)
+      seq: int | None
+      error: str | None (populated on captcha/error)
+    """
+    result = {"row": pending_row["row"], "seq": pending_row.get("seq"),
+              "status": "error", "hits": [], "error": None}
+    query = pending_row["ebay_title"]
+    print(f"[eBay] row {pending_row['row']} seq {pending_row['seq']}: "
+          f"searching '{query[:60]}...'")
+    try:
+        hits = search_ebay_au(query, port)
+        if not hits:
+            result["status"] = "no_match"
+            print("  0 results")
+        else:
+            result["hits"] = hits
+            result["status"] = "ok"
+            print(f"  {len(hits)} hit(s): "
+                  + ", ".join(f"${h.delivered_price:.2f}" for h in hits))
+    except RuntimeError as e:
+        msg = str(e)
+        if "blocked" in msg.lower() or "captcha" in msg.lower():
+            result["status"] = "captcha"
+            result["error"] = msg
+            print(f"  CAPTCHA: {msg}")
+        else:
+            result["error"] = msg
+            print(f"  ERROR: {msg}")
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"  ERROR: {e}")
+    return result
+
+
+def _apply_result_to_row(ws, result: dict, today: str, ws_lock: threading.Lock) -> None:
+    """Serialize the write-back (Excel isn't thread-safe)."""
+    with ws_lock:
+        row = result["row"]
+        status = result["status"]
+        if status == "ok":
+            hits = result["hits"]
+            # Sort by delivered_price: cheaper → O/P, pricier → Q/R.
+            # Tie-break stable (Best Match rank 1 wins the O slot).
+            sorted_hits = sorted(hits, key=lambda h: h.delivered_price)
+            low = sorted_hits[0]
+            high = sorted_hits[1] if len(sorted_hits) >= 2 else None
+            _write_ebay_result(
+                ws, row=row, search_date=today,
+                low_price=low.delivered_price, low_url=low.url,
+                high_price=(high.delivered_price if high else None),
+                high_url=(high.url if high else None),
+            )
+        elif status == "no_match":
+            _write_ebay_result(ws, row=row, search_date=today, no_match=True)
+        else:
+            # captcha / error → do NOT write N; row retries next run.
+            logger.info("    row %d skipped (%s)", row, status)
+
+
+def process_excel(xlsx_path: Path) -> None:
+    """Process every worksheet in the file. See module docstring."""
+    logger.info("Opening: %s", xlsx_path.name)
+    wb = load_workbook(xlsx_path)
+    ws_lock = threading.Lock()
+
+    for ws_name in wb.sheetnames:
+        ws = wb[ws_name]
+        pending = _read_ebay_pending_rows(ws)
+        if not pending:
+            logger.info("  Sheet '%s': no rows to search (or not template schema)",
+                        ws_name.strip())
+            continue
+
+        logger.info("  Sheet '%s': %d pending row(s): seq %s",
+                    ws_name.strip(), len(pending),
+                    [p["seq"] for p in pending])
+
+        _reset_rate_limit_state()
+        _ensure_ebay_session(CDP_PORT)
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        rate_limited = False
+
+        total = len(pending)
+        for batch_start in range(0, total, MAX_PARALLEL_TABS):
+            batch_end = min(batch_start + MAX_PARALLEL_TABS, total)
+            with _rate_limit_lock:
+                if rate_limited:
+                    break
+
+            with ThreadPoolExecutor(max_workers=MAX_PARALLEL_TABS) as ex:
+                futures = [
+                    ex.submit(_check_one_row, pending[i], CDP_PORT)
+                    for i in range(batch_start, batch_end)
+                ]
+                tripped_early = False
+                for fut in as_completed(futures):
+                    try:
+                        result = fut.result()
+                    except Exception as e:
+                        result = {"row": -1, "seq": None, "status": "error",
+                                  "hits": [], "error": str(e)}
+                    _apply_result_to_row(ws, result, today, ws_lock)
+                    if _record_result_for_rate_limit(
+                        "OK" if result["status"] in ("ok", "no_match") else "FAIL"
+                    ):
+                        tripped_early = True
+                        break
+                # Drain completed-but-uncollected futures.
+                if tripped_early:
+                    for fut in futures:
+                        if fut.done():
+                            try:
+                                result = fut.result()
+                                _apply_result_to_row(ws, result, today, ws_lock)
+                            except Exception:
+                                pass
+                    rate_limited = True
+
+            if batch_end < total and not rate_limited:
+                _inter_url_pause(batch_end, total)
+
+        safe_save(wb, xlsx_path)
+        logger.info("  Saved progress to %s", xlsx_path.name)
+
+    wb.close()
+    logger.info("Done: %s", xlsx_path.name)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Post-Shein-scrape eBay price check helper (澳洲站)")
+    parser.add_argument("file", nargs="?", default=None,
+                        help="Path to .xlsx (default: SHEIN_INPUT_FILENAME under SUBMITTED_DIR)")
+    args = parser.parse_args()
+
+    setup_logging()
+
+    if args.file:
+        xlsx_path = Path(args.file)
+    elif INPUT_FILENAME:
+        xlsx_path = SUBMITTED_DIR / INPUT_FILENAME
+    else:
+        logger.error("No file given and SHEIN_INPUT_FILENAME not set in .env")
+        sys.exit(1)
+
+    if not xlsx_path.exists():
+        logger.error("File not found: %s", xlsx_path)
+        sys.exit(1)
+
+    _ensure_chrome()  # launches or reuses Chrome on CDP_PORT
+
+    try:
+        process_excel(xlsx_path)
+    except RateLimitError:
+        logger.warning("[限流] Rate limited — some rows left unsearched")
+    except Exception as e:
+        logger.exception("Fatal error: %s", e)
+        try:
+            tb = traceback.format_exc()
+            (DEBUG_LOG_DIR / "last_traceback.txt").write_text(tb, encoding="utf-8")
+        except OSError:
+            pass
+    logger.info("All done.")
+
+
+if __name__ == "__main__":
+    main()
