@@ -108,51 +108,82 @@ def _extract_from_page(raw_hits: list) -> "list[EbayHit]":
 
 
 # ── JavaScript: extract top search results from ebay.com.au SRP ─────────────
+# eBay rolled out `.s-card` in late 2026 (new "su-*" design system) — the
+# older `.s-item` selectors are gone. Placeholder cards with fake test URLs
+# (e.g. `ebay.com/itm/123456`) sometimes appear as the first 1-2 items; we
+# filter by requiring a real `www.ebay.com.au/itm/<numeric-id>` href.
 _JS_EBAY_SEARCH_EXTRACT = r"""
 (function() {
-    // Card selectors: eBay AU uses .s-item within #srp-river-results as of 2026.
-    // Selector chain is defensive — fall back to older classes if the primary
-    // isn't found.
-    const cards = document.querySelectorAll(
-        '#srp-river-results li.s-item, ul.srp-results li.s-item, li.s-item'
-    );
+    const cards = document.querySelectorAll('li.s-card');
     const out = [];
     for (const c of cards) {
-        // Skip the "Shop on eBay" placeholder card that eBay sometimes injects.
-        const t = (c.querySelector('.s-item__title, [class*="title"]')?.innerText || '').trim();
+        // The listing link. Real eBay AU items have www.ebay.com.au/itm/<id>.
+        const linkEl = c.querySelector('a.s-card__link, a[href*="/itm/"]');
+        const url = linkEl?.href || '';
+        // Skip placeholder cards ('ebay.com/itm/123456' fake URLs).
+        if (!/\bebay\.com\.au\/itm\/\d/.test(url)) continue;
+
+        const t = (c.querySelector('.s-card__title, [class*="s-card__title"]')?.innerText || '').trim();
         if (!t || /^shop on ebay$/i.test(t)) continue;
 
-        const priceEl = c.querySelector('.s-item__price, [class*="price"]');
+        // Price lives in .s-card__price (usually inside a `su-styled-text` span).
+        const priceEl = c.querySelector('.s-card__price, [class*="s-card__price"]');
         const price = (priceEl?.innerText || '').trim();
 
-        // Postage lives in a nearby element — labels vary. Try several.
+        // Postage: eBay AU uses .s-card__subtitle-row / .s-card__subtitle
+        // for shipping labels. Fall back to any nearby element mentioning
+        // postage/shipping/delivery.
         const postEl =
-            c.querySelector('.s-item__shipping, .s-item__logisticsCost') ||
+            c.querySelector('.s-card__subtitle-row, .s-card__subtitle') ||
             [...c.querySelectorAll('span,div')].find(e =>
                 /postage|shipping|delivery/i.test(e.innerText || ''));
         const postage = (postEl?.innerText || '').trim();
 
-        // The listing link is the .s-item__link anchor.
-        const linkEl = c.querySelector('a.s-item__link, a[href*="/itm/"]');
-        const url = linkEl?.href || '';
-
-        // First thumbnail image.
-        const imgEl = c.querySelector('img.s-item__image-img, img[src*="ebayimg"]');
+        const imgEl = c.querySelector('img[src*="ebayimg"], img.s-card__image');
         const image_url = imgEl?.src || '';
 
         if (t && price && url) {
             out.push({title: t, price: price, postage: postage, url: url, image_url: image_url});
         }
-        if (out.length >= 5) break;  // grab a small pool; extractor keeps top 2
+        if (out.length >= 5) break;
     }
     // Signal whether the SRP shell has rendered (page loaded, ready to inspect).
     // If the shell is absent, caller treats this as a timeout, not a genuine 0-result.
     var loaded = !!document.querySelector(
-        '#srp-river-results, .srp-results, .srp-controls, [class*="srp-list"]'
+        '#srp-river-results, .srp-results, .srp-controls, .srp-river-main, [class*="srp-list"]'
     );
     return {loaded: loaded, hits: out};
 })()
 """
+
+
+def _shorten_query(k) -> str:
+    """Turn an 80-char AI-optimized eBay listing title into a 3-5 word search
+    query. AI titles are keyword-packed for SEO discovery on eBay LISTINGS,
+    but as SEARCH queries they return 0 results because eBay treats the
+    long string as a strict phrase match. Strips leading quantity tokens
+    ('12pcs', '100Pcs', '1/2pcs', '1 Set') to focus on product nouns, then
+    caps at 5 words / 50 chars."""
+    if not k or not isinstance(k, str):
+        return ""
+    words = k.strip().split()
+    # Strip leading quantity tokens (up to 2 at the front).
+    # Matches: 12pcs, 100Pcs, 1/2pcs, 1, 2Pcs, 1Set, 1-2pcs, etc.
+    qty_pat = re.compile(r'^\d[\dxX/\-]*(pc|pcs|set|sets|pack|packs)?$', re.IGNORECASE)
+    setword_pat = re.compile(r'^(pc|pcs|set|sets|pack|packs|piece|pieces)$', re.IGNORECASE)
+    dropped = 0
+    while words and dropped < 2:
+        if qty_pat.match(words[0]) or setword_pat.match(words[0]):
+            words.pop(0)
+            dropped += 1
+        else:
+            break
+    picked = words[:5]
+    q = " ".join(picked)
+    if len(q) > 50:
+        cut = q[:50].rsplit(" ", 1)[0]
+        q = cut
+    return q
 
 
 # Import CDP helpers from shein_scraper. These are stable, module-level.
@@ -192,13 +223,19 @@ def _ensure_ebay_session(port: int = CDP_PORT) -> None:
 def search_ebay_au(query: str, port: int = CDP_PORT) -> "list[EbayHit]":
     """Open a fresh tab, run an eBay AU search with Best Match / New / BIN /
     AU-located filters, extract the top-2 listings. Returns [] on zero
-    results. Raises RuntimeError on captcha (caller handles retry)."""
+    results. Raises RuntimeError on captcha (caller handles retry).
+
+    `query` is expected to be the K-column AI-optimized eBay listing title.
+    It gets internally shortened via _shorten_query — eBay treats 80-char
+    strings as a phrase match and returns 0 results."""
     from urllib.parse import quote
     from shein_scraper import _JS_DETECT_BLOCK  # reuse existing block detector
 
-    q = quote((query or "").strip(), safe="")
-    if not q:
+    short = _shorten_query(query)
+    if not short:
         return []
+    print(f"    [query] '{query[:50]}...' -> '{short}'")
+    q = quote(short, safe="")
     url = (
         "https://www.ebay.com.au/sch/i.html"
         f"?_nkw={q}"
