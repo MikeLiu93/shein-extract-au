@@ -105,3 +105,131 @@ def _extract_from_page(raw_hits: list) -> "list[EbayHit]":
             image_url=str(raw.get("image_url") or "").strip(),
         ))
     return out
+
+
+# ── JavaScript: extract top search results from ebay.com.au SRP ─────────────
+_JS_EBAY_SEARCH_EXTRACT = r"""
+(function() {
+    // Card selectors: eBay AU uses .s-item within #srp-river-results as of 2026.
+    // Selector chain is defensive — fall back to older classes if the primary
+    // isn't found.
+    const cards = document.querySelectorAll(
+        '#srp-river-results li.s-item, ul.srp-results li.s-item, li.s-item'
+    );
+    const out = [];
+    for (const c of cards) {
+        // Skip the "Shop on eBay" placeholder card that eBay sometimes injects.
+        const t = (c.querySelector('.s-item__title, [class*="title"]')?.innerText || '').trim();
+        if (!t || /^shop on ebay$/i.test(t)) continue;
+
+        const priceEl = c.querySelector('.s-item__price, [class*="price"]');
+        const price = (priceEl?.innerText || '').trim();
+
+        // Postage lives in a nearby element — labels vary. Try several.
+        const postEl =
+            c.querySelector('.s-item__shipping, .s-item__logisticsCost') ||
+            [...c.querySelectorAll('span,div')].find(e =>
+                /postage|shipping|delivery/i.test(e.innerText || ''));
+        const postage = (postEl?.innerText || '').trim();
+
+        // The listing link is the .s-item__link anchor.
+        const linkEl = c.querySelector('a.s-item__link, a[href*="/itm/"]');
+        const url = linkEl?.href || '';
+
+        // First thumbnail image.
+        const imgEl = c.querySelector('img.s-item__image-img, img[src*="ebayimg"]');
+        const image_url = imgEl?.src || '';
+
+        if (t && price && url) {
+            out.push({title: t, price: price, postage: postage, url: url, image_url: image_url});
+        }
+        if (out.length >= 5) break;  // grab a small pool; extractor keeps top 2
+    }
+    return out;
+})()
+"""
+
+
+# Import CDP helpers from shein_scraper. These are stable, module-level.
+from shein_scraper import (
+    CDP_PORT,
+    _cdp_once,
+    _new_tab,
+    _close_tab,
+    _ws_url_for_id,
+    _run_js,
+)
+
+
+_EBAY_SESSION_WARMED = False
+
+
+def _ensure_ebay_session(port: int = CDP_PORT) -> None:
+    """Warm the browser session by loading ebay.com.au once. Idempotent —
+    later calls in the same process are no-ops. Runs before the pool starts."""
+    global _EBAY_SESSION_WARMED
+    if _EBAY_SESSION_WARMED:
+        return
+    import requests, time
+    tabs = requests.get(f"http://localhost:{port}/json", timeout=5).json()
+    pages = [t for t in tabs if t.get("type") == "page"]
+    ebay_pages = [t for t in pages if "ebay." in (t.get("url") or "")]
+    if ebay_pages:
+        _EBAY_SESSION_WARMED = True
+        return
+    print("  [导航] 预热：先访问 ebay.com.au 首页建立 session...")
+    tab_id, ws_url = _new_tab(port, url="https://www.ebay.com.au/")
+    time.sleep(4)
+    _close_tab(port, tab_id)
+    _EBAY_SESSION_WARMED = True
+
+
+def search_ebay_au(query: str, port: int = CDP_PORT) -> "list[EbayHit]":
+    """Open a fresh tab, run an eBay AU search with Best Match / New / BIN /
+    AU-located filters, extract the top-2 listings. Returns [] on zero
+    results. Raises RuntimeError on captcha (caller handles retry)."""
+    from urllib.parse import quote
+    from shein_scraper import _JS_DETECT_BLOCK  # reuse existing block detector
+
+    q = quote((query or "").strip(), safe="")
+    if not q:
+        return []
+    url = (
+        "https://www.ebay.com.au/sch/i.html"
+        f"?_nkw={q}"
+        "&LH_BIN=1"
+        "&LH_ItemCondition=1000"
+        "&LH_PrefLoc=1"
+        "&_sop=12"
+    )
+
+    tab_id, ws_url = _new_tab(port, url=url)
+    if not tab_id:
+        raise RuntimeError("Failed to open eBay search tab")
+    try:
+        import time
+        # Wait for results grid — poll a few seconds. 2s min, up to 10s.
+        deadline = time.monotonic() + 10.0
+        time.sleep(2)
+        raw_hits = []
+        while time.monotonic() < deadline:
+            ws_url = _ws_url_for_id(port, tab_id)
+            # Captcha check
+            try:
+                blk = _run_js(ws_url, _JS_DETECT_BLOCK)
+                if isinstance(blk, dict) and blk.get("blocked"):
+                    raise RuntimeError(f"eBay blocked: {blk.get('type')}")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+            try:
+                raw_hits = _run_js(ws_url, _JS_EBAY_SEARCH_EXTRACT) or []
+                if raw_hits:
+                    break
+            except Exception:
+                pass
+            time.sleep(1.0)
+        return _extract_from_page(raw_hits)
+    finally:
+        _close_tab(port, tab_id)
