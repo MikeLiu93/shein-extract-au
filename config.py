@@ -53,5 +53,5 @@ INPUT_FILENAME = os.environ.get("SHEIN_INPUT_FILENAME", "").strip()
 
 OUTPUT_ROOT_2ND = Path(os.environ.get(
     "SHEIN_OUTPUT_DIR",
-    str(Path(_AU_BASE) / "上架资料-已完成"),
+    _AU_BASE,  # 默认与 SUBMITTED_DIR 同级；店铺名自动作为下一级子文件夹
 ))
