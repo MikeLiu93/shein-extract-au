@@ -199,51 +199,6 @@ def _sheet_matches_template(ws) -> bool:
     return str(ws.cell(1, COL_URL).value or "").strip() == "链接"
 
 
-def _read_pending_rows(ws) -> list[dict]:
-    """Return [{row, seq, url, price, shipping, variant_filter}, ...] for
-    rows that have 链接 filled and 日期/状态 both empty. Non-template sheets
-    return []. Empty 原价/运费 come through as None (scraper fallback)."""
-    if not _sheet_matches_template(ws):
-        return []
-    pending = []
-    for r in range(2, ws.max_row + 1):
-        seq = ws.cell(r, COL_SEQ).value
-        url = ws.cell(r, COL_URL).value
-        date_v = ws.cell(r, COL_DATE).value
-        status_v = ws.cell(r, COL_STATUS).value
-        if not url or date_v or status_v:
-            continue
-        if seq is None:
-            logger.info("  row %d: skip (no 编号)", r)
-            continue
-        raw_price = ws.cell(r, COL_PRICE).value
-        raw_ship = ws.cell(r, COL_SHIPPING).value
-        try:
-            price = float(raw_price) if raw_price not in (None, "") else None
-        except (TypeError, ValueError):
-            logger.info("  row %d: skip (原价 '%s' not numeric)", r, raw_price)
-            continue
-        try:
-            shipping = float(raw_ship) if raw_ship not in (None, "") else None
-        except (TypeError, ValueError):
-            logger.info("  row %d: skip (运费 '%s' not numeric)", r, raw_ship)
-            continue
-        try:
-            seq_int = int(seq)
-        except (TypeError, ValueError):
-            logger.info("  row %d: skip (编号 '%s' not numeric)", r, seq)
-            continue
-        variant_filter = str(ws.cell(r, COL_VARIANT_FILTER).value or "").strip()
-        pending.append({
-            "row": r,
-            "seq": seq_int,
-            "url": str(url).strip(),
-            "price": price,
-            "shipping": shipping,
-            "variant_filter": variant_filter,
-        })
-    return pending
-
 
 def _write_result_row(
     ws, row: int, date: str, status: str,
@@ -311,21 +266,29 @@ def safe_save(wb, xlsx_path: Path) -> None:
         logger.info("Saved to alternate: %s", alt.name)
 
 
-def process_excel(xlsx_path: Path) -> None:
-    """Process all worksheets in `xlsx_path` using the Chinese-header template
-    schema. Non-template sheets are skipped. See design spec §1 for columns."""
-    logger.info("Opening: %s", xlsx_path.name)
-    wb = load_workbook(xlsx_path)
+def process_excel(master_path: Path, enriched_path: Path) -> None:
+    """Read the master (input) workbook, scrape every row where F='Y', and
+    append one row per (product × run) to the enriched (output) workbook.
+    The master is opened read-only; only the enriched is saved. See spec
+    2026-08-04-master-enriched-split-design.md."""
+    logger.info("Master:   %s", master_path.name)
+    logger.info("Enriched: %s", enriched_path.name)
 
-    for ws_name in wb.sheetnames:
-        ws = wb[ws_name]
+    if not master_path.exists():
+        logger.error("Master file not found: %s", master_path)
+        return
+
+    master_wb = load_workbook(master_path, read_only=False)  # read-only intent — no save() called
+
+    for ws_name in master_wb.sheetnames:
+        master_ws = master_wb[ws_name]
         store = ws_name.strip()
-        pending = _read_pending_rows(ws)
+        pending = _read_master_pending_rows(master_ws)
         if not pending:
-            logger.info("  Sheet '%s': no pending rows (or not template schema)", store)
+            logger.info("  Sheet '%s': no F=Y rows (or not master schema)", store)
             continue
 
-        logger.info("  Sheet '%s': %d pending row(s): seq %s",
+        logger.info("  Sheet '%s': %d row(s) with F=Y: seq %s",
                     store, len(pending), [p["seq"] for p in pending])
 
         store_dir = OUTPUT_ROOT / store
@@ -373,9 +336,15 @@ def process_excel(xlsx_path: Path) -> None:
         finally:
             os.chdir(old_cwd)
 
-        # Fan results back into the template rows
+        # Open (or create) enriched sheet — one save per sheet at the end.
+        try:
+            enriched_wb, enriched_ws = _ensure_enriched_sheet(enriched_path, store)
+        except ValueError as e:
+            logger.error("  Cannot open enriched sheet '%s': %s", store, e)
+            continue
+
+        # Append one row per pending master row.
         for p in pending:
-            row = p["row"]
             seq = p["seq"]
             seq_folder = store_dir / str(seq)
             has_files = seq_folder.is_dir() and any(seq_folder.iterdir())
@@ -389,33 +358,36 @@ def process_excel(xlsx_path: Path) -> None:
                                 or "[goods_name]" in (rec.get("title") or "")))
 
             if has_files and not is_bad_data and rec:
-                _write_result_row(
-                    ws, row=row,
-                    date=today, status="Done",
-                    picture_path=rec.get("first_image_path") or None,
-                    web_price=rec.get("web_price_display"),
-                    shein_title=rec.get("original_title") or rec.get("title"),
-                    ebay_title=rec.get("ebay_title"),
-                    ebay_price=rec.get("ebay_price"),
-                    stock=rec.get("stock_summary"),
-                )
-                logger.info("    seq %d → Done", seq)
+                result_dict = {
+                    "date": today,
+                    "status": "Done",
+                    "web_price": rec.get("web_price_display"),
+                    "shein_title": rec.get("original_title") or rec.get("title"),
+                    "ebay_title": rec.get("ebay_title"),
+                    "ebay_price": rec.get("ebay_price"),
+                    "stock": rec.get("stock_summary"),
+                }
+                picture = rec.get("first_image_path") or None
+                _append_enriched_row(enriched_ws, p, result_dict, picture_path=picture)
+                logger.info("    seq %d → Done (appended row %d)", seq, enriched_ws.max_row)
             elif rec and rec.get("status") == "DELISTED":
-                _write_result_row(ws, row=row, date=today, status="Delisted")
+                _append_enriched_row(enriched_ws, p,
+                                     {"date": today, "status": "Delisted"})
                 logger.info("    seq %d → Delisted", seq)
             else:
                 detail = rec.get("status", "") if rec else ""
                 if is_bad_data:
                     detail = "no data loaded"
-                _write_result_row(ws, row=row, date=today, status="Failed")
+                _append_enriched_row(enriched_ws, p,
+                                     {"date": today, "status": "Failed"})
                 logger.info("    seq %d → Failed %s", seq,
                             f"({detail})" if detail else "")
 
-        safe_save(wb, xlsx_path)
-        logger.info("  Saved progress to %s", xlsx_path.name)
+        safe_save(enriched_wb, enriched_path)
+        logger.info("  Saved enriched progress to %s", enriched_path.name)
 
-    wb.close()
-    logger.info("Done: %s", xlsx_path.name)
+    master_wb.close()
+    logger.info("Done.")
 
 
 def _discover_xlsx(submitted_dir: Path) -> list[Path]:
@@ -437,36 +409,38 @@ def _discover_xlsx(submitted_dir: Path) -> list[Path]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Excel-based Shein scraper pipeline (澳洲站)")
-    parser.add_argument("file", nargs="?", default=None,
-                        help="Path to .xlsx file (default: 处理 SUBMITTED_DIR 下所有 .xlsx)")
+        description="Master → Enriched Shein scrape pipeline (澳洲站)")
+    parser.add_argument("master_file", nargs="?", default=None,
+                        help="Master (input) .xlsx path. Default: "
+                             "SUBMITTED_DIR/SHEIN_INPUT_FILENAME.")
+    parser.add_argument("--enriched", default=None,
+                        help="Enriched (output) .xlsx path. Default: "
+                             "SUBMITTED_DIR/SHEIN_OUTPUT_FILENAME.")
     args = parser.parse_args()
 
     setup_logging()
 
-    if args.file:
-        files = [Path(args.file)]
+    from config import require_output_filename
+    output_name = require_output_filename()
+
+    if args.master_file:
+        master_path = Path(args.master_file)
     elif INPUT_FILENAME:
-        candidate = SUBMITTED_DIR / INPUT_FILENAME
-        if candidate.exists():
-            files = [candidate]
-        else:
-            logger.error("INPUT_FILENAME 设置但找不到: %s", candidate)
-            return
+        master_path = SUBMITTED_DIR / INPUT_FILENAME
     else:
-        files = _discover_xlsx(SUBMITTED_DIR)
-        if not files:
-            logger.error("SUBMITTED_DIR 下没有 .xlsx 文件: %s", SUBMITTED_DIR)
-            return
-        logger.info("发现 %d 个输入文件: %s", len(files), [f.name for f in files])
+        logger.error("No master file given and SHEIN_INPUT_FILENAME not set in .env")
+        return
 
-    for f in files:
-        logger.info("=" * 60)
-        try:
-            process_excel(f)
-        except Exception as e:
-            logger.exception("Fatal error processing %s: %s", f.name, e)
+    if args.enriched:
+        enriched_path = Path(args.enriched)
+    else:
+        enriched_path = SUBMITTED_DIR / output_name
 
+    logger.info("=" * 60)
+    try:
+        process_excel(master_path, enriched_path)
+    except Exception as e:
+        logger.exception("Fatal error: %s", e)
     logger.info("All done.")
 
 
