@@ -52,9 +52,13 @@ COL_DATE, COL_STATUS, COL_PICTURE = 6, 7, 8
 COL_WEB_PRICE, COL_SHEIN_TITLE = 9, 10
 COL_EBAY_TITLE, COL_EBAY_PRICE, COL_STOCK = 11, 12, 13
 
+# Enriched sheet columns A~U. See spec 2026-08-04-master-enriched-split-design.md §2.
 EXPECTED_HEADERS = ["编号", "链接", "原价", "运费", "变体",
                     "日期", "状态", "图片", "希音价格", "希音标题",
-                    "eBay标题", "eBay价格", "库存"]
+                    "eBay标题", "eBay价格", "库存",
+                    "eBay搜索日期", "eBay同类低价", "低价链接",
+                    "eBay同类高价", "高价链接",
+                    "Shein重跑日期", "更新价格", "更新库存"]
 
 # ── Master (输入) schema ─────────────────────────────────────────────────────
 # 主表只有 6 列，脚本只读。See spec 2026-08-04-master-enriched-split-design.md §1.
