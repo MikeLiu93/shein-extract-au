@@ -56,6 +56,61 @@ EXPECTED_HEADERS = ["编号", "链接", "原价", "运费", "变体",
                     "日期", "状态", "图片", "希音价格", "希音标题",
                     "eBay标题", "eBay价格", "库存"]
 
+# ── Master (输入) schema ─────────────────────────────────────────────────────
+# 主表只有 6 列，脚本只读。See spec 2026-08-04-master-enriched-split-design.md §1.
+MASTER_COL_TRIGGER = 6  # F 是否要跑 (Y/空/其他)
+
+MASTER_EXPECTED_HEADERS = ["编号", "链接", "原价", "运费", "变体", "是否要跑"]
+
+
+def _read_master_pending_rows(ws) -> list[dict]:
+    """Return list of dicts for rows in the master where F (是否要跑) normalizes
+    to 'Y' (case-insensitive, whitespace-stripped). Non-master sheets return [].
+    Shape: {row, seq, url, price, shipping, variant_filter}. Rows with invalid
+    seq or missing URL are logged and skipped."""
+    if not _sheet_matches_template(ws):
+        return []
+    pending = []
+    for r in range(2, ws.max_row + 1):
+        seq = ws.cell(r, COL_SEQ).value
+        url = ws.cell(r, COL_URL).value
+        trigger = str(ws.cell(r, MASTER_COL_TRIGGER).value or "").strip().upper()
+        if trigger != "Y":
+            continue
+        if not url:
+            logger.info("  row %d: skip (F=Y but 链接 empty)", r)
+            continue
+        try:
+            seq_int = int(seq) if seq is not None else None
+        except (TypeError, ValueError):
+            logger.info("  row %d: skip (编号 '%s' not numeric)", r, seq)
+            continue
+        if seq_int is None:
+            logger.info("  row %d: skip (编号 empty)", r)
+            continue
+        raw_price = ws.cell(r, COL_PRICE).value
+        raw_ship = ws.cell(r, COL_SHIPPING).value
+        try:
+            price = float(raw_price) if raw_price not in (None, "") else None
+        except (TypeError, ValueError):
+            logger.info("  row %d: skip (原价 '%s' not numeric)", r, raw_price)
+            continue
+        try:
+            shipping = float(raw_ship) if raw_ship not in (None, "") else None
+        except (TypeError, ValueError):
+            logger.info("  row %d: skip (运费 '%s' not numeric)", r, raw_ship)
+            continue
+        variant_filter = str(ws.cell(r, COL_VARIANT_FILTER).value or "").strip()
+        pending.append({
+            "row": r,
+            "seq": seq_int,
+            "url": str(url).strip(),
+            "price": price,
+            "shipping": shipping,
+            "variant_filter": variant_filter,
+        })
+    return pending
+
 
 def _sheet_matches_template(ws) -> bool:
     """The sheet must have '链接' in col B row 1 to be treated as the new schema."""
