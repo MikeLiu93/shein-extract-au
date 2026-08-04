@@ -112,6 +112,42 @@ def _read_master_pending_rows(ws) -> list[dict]:
     return pending
 
 
+def _ensure_enriched_sheet(enriched_path, sheet_name: str):
+    """Load or create the enriched workbook, then load or create the store
+    sheet with the 21-col header row. Returns (wb, ws). Raises ValueError if
+    a sheet exists with mismatched headers (prevents silent schema drift)."""
+    from pathlib import Path
+    from openpyxl import Workbook, load_workbook
+
+    p = Path(enriched_path)
+    if p.exists():
+        wb = load_workbook(p)
+    else:
+        wb = Workbook()
+        # openpyxl seeds a default 'Sheet' we don't want in the final layout.
+        default_name = wb.sheetnames[0]
+        if default_name != sheet_name:
+            del wb[default_name]
+
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        # Validate headers on existing sheet — hard error on drift.
+        for ci, expected in enumerate(EXPECTED_HEADERS, 1):
+            actual = ws.cell(1, ci).value
+            if actual != expected:
+                raise ValueError(
+                    f"Enriched sheet '{sheet_name}' header mismatch at col {ci}: "
+                    f"expected {expected!r}, got {actual!r}. Fix the file or "
+                    f"delete the sheet to have it recreated."
+                )
+    else:
+        ws = wb.create_sheet(sheet_name)
+        for ci, header in enumerate(EXPECTED_HEADERS, 1):
+            ws.cell(1, ci).value = header
+
+    return wb, ws
+
+
 def _sheet_matches_template(ws) -> bool:
     """The sheet must have '链接' in col B row 1 to be treated as the new schema."""
     return str(ws.cell(1, COL_URL).value or "").strip() == "链接"
