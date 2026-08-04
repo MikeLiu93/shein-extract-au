@@ -152,6 +152,48 @@ def _ensure_enriched_sheet(enriched_path, sheet_name: str):
     return wb, ws
 
 
+def _append_enriched_row(ws, master_row: dict, result: dict,
+                          picture_path=None) -> int:
+    """Append one row to the enriched sheet at row = ws.max_row + 1.
+
+    - master_row must have: seq, url, price, shipping, variant_filter
+      (copied verbatim to A-E — a snapshot of the master row's values at
+      scrape time).
+    - result may have: date, status, web_price, shein_title, ebay_title,
+      ebay_price, stock. Unspecified keys skip that cell.
+    - picture_path (optional) — file path to embed in H; row height auto-grown.
+
+    Returns the row index that was written."""
+    row = ws.max_row + 1
+    # If the sheet only has the header row, max_row is 1 → row = 2 (correct).
+    # If it has header + N data rows, row = N + 2 (correct).
+
+    # A-E: master snapshot.
+    ws.cell(row, COL_SEQ).value = master_row.get("seq")
+    ws.cell(row, COL_URL).value = master_row.get("url")
+    if master_row.get("price") is not None:
+        ws.cell(row, COL_PRICE).value = master_row["price"]
+    if master_row.get("shipping") is not None:
+        ws.cell(row, COL_SHIPPING).value = master_row["shipping"]
+    if master_row.get("variant_filter"):
+        ws.cell(row, COL_VARIANT_FILTER).value = master_row["variant_filter"]
+
+    # F-M: scrape result (via existing writer, which already handles
+    # None-means-skip semantics and image embedding).
+    _write_result_row(
+        ws, row=row,
+        date=result.get("date", ""),
+        status=result.get("status", ""),
+        picture_path=picture_path,
+        web_price=result.get("web_price"),
+        shein_title=result.get("shein_title"),
+        ebay_title=result.get("ebay_title"),
+        ebay_price=result.get("ebay_price"),
+        stock=result.get("stock"),
+    )
+    return row
+
+
 def _sheet_matches_template(ws) -> bool:
     """The sheet must have '链接' in col B row 1 to be treated as the new schema."""
     return str(ws.cell(1, COL_URL).value or "").strip() == "链接"

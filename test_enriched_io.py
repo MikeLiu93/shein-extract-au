@@ -91,10 +91,76 @@ def test_default_workbook_sheet_removed_when_creating_new_file():
         assert wb2.sheetnames == ["ZR1"], wb2.sheetnames
 
 
+def test_append_row_writes_at_max_row_plus_one():
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "enriched.xlsx"
+        wb, ws = _ensure_enriched_sheet(p, "ZR1")
+        # Import the appender we're about to build.
+        from run_excel import _append_enriched_row
+
+        master_row = {
+            "row": 5, "seq": 42, "url": "http://u", "price": 10.0,
+            "shipping": 7.95, "variant_filter": "Black",
+        }
+        # Simulate a successful scrape result.
+        result = {
+            "date": "2026-08-04",
+            "status": "Done",
+            "web_price": 9.99,
+            "shein_title": "Shein Title",
+            "ebay_title": "eBay Title",
+            "ebay_price": 25.93,
+            "stock": "M: 20",
+        }
+        _append_enriched_row(ws, master_row, result, picture_path=None)
+        # First data row = row 2.
+        assert ws.cell(2, 1).value == 42       # A 编号
+        assert ws.cell(2, 2).value == "http://u"  # B 链接
+        assert ws.cell(2, 3).value == 10.0     # C 原价
+        assert ws.cell(2, 4).value == 7.95     # D 运费
+        assert ws.cell(2, 5).value == "Black"  # E 变体
+        assert ws.cell(2, 6).value == "2026-08-04"  # F 日期
+        assert ws.cell(2, 7).value == "Done"    # G 状态
+        # H 图片 — no picture_path → cell empty (image anchored elsewhere)
+        assert ws.cell(2, 8).value is None
+        assert ws.cell(2, 9).value == 9.99      # I 希音价格
+        assert ws.cell(2, 10).value == "Shein Title"  # J
+        assert ws.cell(2, 11).value == "eBay Title"   # K
+        assert ws.cell(2, 12).value == 25.93    # L eBay 价格
+        assert ws.cell(2, 13).value == "M: 20"  # M 库存
+
+        # Second append lands at row 3 (max_row+1), not overwrite row 2.
+        _append_enriched_row(ws, master_row, result, picture_path=None)
+        assert ws.cell(2, 1).value == 42  # still there
+        assert ws.cell(3, 1).value == 42  # second appended
+
+
+def test_append_row_on_failed_scrape_writes_only_date_and_status():
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "enriched.xlsx"
+        wb, ws = _ensure_enriched_sheet(p, "ZR1")
+        from run_excel import _append_enriched_row
+
+        master_row = {
+            "row": 3, "seq": 7, "url": "http://ux", "price": 5.0,
+            "shipping": 0.0, "variant_filter": "",
+        }
+        result = {"date": "2026-08-04", "status": "Failed"}
+        _append_enriched_row(ws, master_row, result, picture_path=None)
+        assert ws.cell(2, 1).value == 7
+        assert ws.cell(2, 6).value == "2026-08-04"
+        assert ws.cell(2, 7).value == "Failed"
+        # Result cols (H-M) should be None on failure.
+        for c in range(8, 14):
+            assert ws.cell(2, c).value is None
+
+
 if __name__ == "__main__":
     test_creates_file_and_sheet_when_absent()
     test_creates_sheet_when_file_exists_but_sheet_missing()
     test_reuses_existing_sheet_with_matching_headers()
     test_hard_error_on_header_mismatch()
     test_default_workbook_sheet_removed_when_creating_new_file()
+    test_append_row_writes_at_max_row_plus_one()
+    test_append_row_on_failed_scrape_writes_only_date_and_status()
     print("ALL PASS")
