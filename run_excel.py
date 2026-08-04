@@ -1,30 +1,33 @@
 """
-Excel-based pipeline (澳洲站): read pending URLs from .xlsx worksheets (one per
-store), scrape them, write results to OUTPUT_ROOT/{store}/, and update Date +
-Status columns in the source Excel.
+Excel-based pipeline (澳洲站): read pending URLs from the MASTER (input) .xlsx,
+scrape them, and APPEND results as new rows to the ENRICHED (output) .xlsx —
+one row per (product × run). Master is opened read-only; only enriched is
+saved. See docs/superpowers/specs/2026-08-04-master-enriched-split-design.md.
 
 Usage:
-    python run_excel.py                          # 扫描 SUBMITTED_DIR 下所有 .xlsx
-    python run_excel.py "path/to/file.xlsx"      # 指定文件
+    python run_excel.py                              # SUBMITTED_DIR/SHEIN_INPUT_FILENAME
+                                                     # + SUBMITTED_DIR/SHEIN_OUTPUT_FILENAME
+    python run_excel.py "path/to/master.xlsx"        # explicit master
+    python run_excel.py <master> --enriched <path>   # explicit both
 
-Columns (strict, Chinese-header template schema):
-    A: 编号       — sequence number (= output folder name). READ.
-    B: 链接       — Shein product URL. READ.
-    C: 原价       — manual sale price (AUD). READ. Blank → use scraped price.
-    D: 运费       — manual shipping (AUD). READ. Blank → use scraped shipping.
-    E: 变体       — variant filter declaration. READ. Blank → scrape all.
-    F: 日期       — run date. WRITE.
-    G: 状态       — Done / Failed / Delisted. WRITE.
-    H: 图片       — embedded first product image (scaled). WRITE.
-    I: 希音价格   — scraped price. Single value → numeric; multi-variant with
-                    differing prices → string range "9.99–14.99". WRITE.
-    J: 希音标题   — raw scraped h1 title. WRITE.
-    K: eBay 标题  — AI-generated (Haiku, fallback to rule). WRITE.
-    L: eBay 价格  — (C or scraped) × 2 + (D or scraped). WRITE.
-    M: 库存       — one-line variant stock summary. WRITE.
+MASTER (input) schema — 6 cols, user-owned, scripts never write:
+    A: 编号        — sequence number (= output folder name). READ.
+    B: 链接        — Shein product URL. READ.
+    C: 原价        — manual sale price (AUD). READ. Blank → use scraped price.
+    D: 运费        — manual shipping (AUD). READ. Blank → use scraped shipping.
+    E: 变体        — variant filter declaration. READ. Blank → scrape all.
+    F: 是否要跑     — 'Y' (any case, whitespace tolerant) triggers this row.
 
-Only rows where 链接 is filled AND 日期/状态 are both empty are processed.
-Non-template sheets (missing '链接' in B1) are skipped.
+ENRICHED (output) schema — 21 cols, script-owned, appended per (product × run):
+    A-E: master snapshot (copied at scrape time)
+    F: 日期, G: 状态, H: 图片, I: 希音价格, J: 希音标题
+    K: eBay标题, L: eBay价格, M: 库存
+    N: eBay搜索日期, O: eBay同类低价, P: 低价链接
+    Q: eBay同类高价, R: 高价链接                   (filled by ebay_price_check.py)
+    S: Shein重跑日期, T: 更新价格, U: 更新库存    (reserved for future)
+
+Only master rows with F='Y' are processed. Non-master sheets (missing '链接'
+in B1) are silently skipped.
 """
 
 import argparse
@@ -388,23 +391,6 @@ def process_excel(master_path: Path, enriched_path: Path) -> None:
 
     master_wb.close()
     logger.info("Done.")
-
-
-def _discover_xlsx(submitted_dir: Path) -> list[Path]:
-    """Top-level .xlsx files only (so the 上架资料-已完成 subfolder isn't scanned).
-    Skip Excel temp lock files (~$...)."""
-    if not submitted_dir.is_dir():
-        return []
-    files = []
-    for p in submitted_dir.iterdir():
-        if not p.is_file():
-            continue
-        if p.suffix.lower() != ".xlsx":
-            continue
-        if p.name.startswith("~$"):
-            continue
-        files.append(p)
-    return sorted(files)
 
 
 def main():
