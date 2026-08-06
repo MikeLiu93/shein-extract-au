@@ -61,23 +61,46 @@ def test_reuses_existing_sheet_with_matching_headers():
         assert ws.cell(2, 2).value == "http://u1"
 
 
-def test_hard_error_on_header_mismatch():
+def test_self_heals_partial_and_typo_headers():
+    """User provides row 1 with typos, missing cols, or extras — script
+    silently rewrites row 1 to the canonical EXPECTED_HEADERS. Data rows
+    below (if any) are preserved. Root-cause fix for the 'output empty'
+    bug employees hit when their headers didn't match exactly."""
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "enriched.xlsx"
         wb0 = Workbook()
         ws0 = wb0.active
         ws0.title = "ZR1"
-        # Wrong headers (missing 图片, extras)
+        # Wrong headers: only 3 cols filled, one typo'd
         _write_headers(ws0, ["编号", "链接", "OOPS"])
+        # Data row 2 — should be preserved untouched
+        ws0.cell(2, 1).value = 999
+        ws0.cell(2, 2).value = "http://existing"
         wb0.save(p)
 
-        raised = False
-        try:
-            _ensure_enriched_sheet(p, "ZR1")
-        except ValueError as e:
-            raised = True
-            assert "header" in str(e).lower(), str(e)
-        assert raised, "expected ValueError on header mismatch"
+        wb, ws = _ensure_enriched_sheet(p, "ZR1")
+        # Row 1 fully seeded to canonical
+        for ci, expected in enumerate(EXPECTED_HEADERS, 1):
+            assert ws.cell(1, ci).value == expected, f"col {ci} not healed"
+        # Row 2 (existing data) preserved
+        assert ws.cell(2, 1).value == 999
+        assert ws.cell(2, 2).value == "http://existing"
+
+
+def test_self_heals_completely_empty_row_1():
+    """A brand-new sheet (no headers at all) gets seeded — this used to
+    raise ValueError on col 1 (None != '编号')."""
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "enriched.xlsx"
+        wb0 = Workbook()
+        ws0 = wb0.active
+        ws0.title = "ZR1"
+        # No headers, just the empty sheet
+        wb0.save(p)
+
+        wb, ws = _ensure_enriched_sheet(p, "ZR1")
+        for ci, expected in enumerate(EXPECTED_HEADERS, 1):
+            assert ws.cell(1, ci).value == expected, f"col {ci} not seeded"
 
 
 def test_default_workbook_sheet_removed_when_creating_new_file():
@@ -159,7 +182,8 @@ if __name__ == "__main__":
     test_creates_file_and_sheet_when_absent()
     test_creates_sheet_when_file_exists_but_sheet_missing()
     test_reuses_existing_sheet_with_matching_headers()
-    test_hard_error_on_header_mismatch()
+    test_self_heals_partial_and_typo_headers()
+    test_self_heals_completely_empty_row_1()
     test_default_workbook_sheet_removed_when_creating_new_file()
     test_append_row_writes_at_max_row_plus_one()
     test_append_row_on_failed_scrape_writes_only_date_and_status()
