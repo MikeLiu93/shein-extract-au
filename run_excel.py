@@ -170,9 +170,28 @@ def _ensure_enriched_sheet(enriched_path, sheet_name: str):
     return wb, ws
 
 
+def _next_data_row(ws, key_col: int = 1) -> int:
+    """Return the row index to append the next data row to: 1 + the highest
+    row with a non-None value in `key_col` (default col A = 编号). If no
+    data rows yet, returns 2 (right after the header row).
+
+    Why not just `ws.max_row + 1`? openpyxl's max_row counts any row with
+    formatting (borders, colors, number-formats, merged cells, etc.), not
+    just data. A brand-new xlsx created by Excel often has phantom empty
+    rows extending to row 1000+ from the operator's initial formatting.
+    Appending at max_row+1 buries the first data at row 1001+, which
+    looks like an 'empty output file' to the operator (they don't scroll).
+    """
+    for r in range(ws.max_row, 1, -1):
+        if ws.cell(r, key_col).value is not None:
+            return r + 1
+    return 2
+
+
 def _append_enriched_row(ws, master_row: dict, result: dict,
                           picture_path=None) -> int:
-    """Append one row to the enriched sheet at row = ws.max_row + 1.
+    """Append one row to the enriched sheet at the next real data row
+    (via _next_data_row — ignores trailing/leading phantom formatting rows).
 
     - master_row must have: seq, url, price, shipping, variant_filter
       (copied verbatim to A-E — a snapshot of the master row's values at
@@ -182,9 +201,7 @@ def _append_enriched_row(ws, master_row: dict, result: dict,
     - picture_path (optional) — file path to embed in H; row height auto-grown.
 
     Returns the row index that was written."""
-    row = ws.max_row + 1
-    # If the sheet only has the header row, max_row is 1 → row = 2 (correct).
-    # If it has header + N data rows, row = N + 2 (correct).
+    row = _next_data_row(ws, key_col=COL_SEQ)
 
     # A-E: master snapshot.
     ws.cell(row, COL_SEQ).value = master_row.get("seq")

@@ -178,6 +178,60 @@ def test_append_row_on_failed_scrape_writes_only_date_and_status():
             assert ws.cell(2, c).value is None
 
 
+def test_append_ignores_phantom_empty_rows_from_formatting():
+    """Reproduce the 'output empty' bug: operator's fresh xlsx has phantom
+    empty rows extending far past the header (Excel formatting artifact).
+    ws.max_row reports a high number, but no real data. Append must land
+    at row 2, not row 1001.
+    """
+    from openpyxl.styles import Border, Side
+    from run_excel import _append_enriched_row, _next_data_row
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "enriched.xlsx"
+        wb, ws = _ensure_enriched_sheet(p, "ZR1")
+        # Simulate the artifact: apply formatting to a distant empty row
+        # (this bumps openpyxl's ws.max_row without adding any data).
+        border = Border(left=Side(style="thin"))
+        for r in range(50, 101):
+            for c in range(1, 22):
+                ws.cell(r, c).border = border
+        # openpyxl.max_row should now report >= 100 despite zero data rows
+        assert ws.max_row >= 100, f"formatting didn't bump max_row: got {ws.max_row}"
+        # Our helper should still know: next data row is 2 (no data yet).
+        assert _next_data_row(ws, key_col=1) == 2
+
+        # Append: should land at row 2, NOT row max_row+1.
+        master_row = {"row": 5, "seq": 99, "url": "http://u",
+                      "price": None, "shipping": None, "variant_filter": ""}
+        _append_enriched_row(ws, master_row, {"date": "d", "status": "Done"})
+        assert ws.cell(2, 1).value == 99, (
+            f"append landed at wrong row; row 2 col A = {ws.cell(2,1).value!r}, "
+            f"max_row = {ws.max_row}")
+
+
+def test_append_after_existing_data_ignores_further_phantom_rows():
+    """If real data exists at row 5 but phantom formatting extends to row
+    500, the next append lands at row 6 — right after the last real row."""
+    from openpyxl.styles import Border, Side
+    from run_excel import _append_enriched_row, _next_data_row
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "enriched.xlsx"
+        wb, ws = _ensure_enriched_sheet(p, "ZR1")
+        # Real data at row 5
+        ws.cell(5, 1).value = 42
+        # Formatting at row 500 → bumps max_row
+        ws.cell(500, 1).border = Border(top=Side(style="thin"))
+        assert ws.max_row >= 500
+        assert _next_data_row(ws, key_col=1) == 6
+
+        master_row = {"row": 8, "seq": 77, "url": "http://u",
+                      "price": None, "shipping": None, "variant_filter": ""}
+        _append_enriched_row(ws, master_row, {"date": "d", "status": "Done"})
+        assert ws.cell(6, 1).value == 77
+
+
 if __name__ == "__main__":
     test_creates_file_and_sheet_when_absent()
     test_creates_sheet_when_file_exists_but_sheet_missing()
@@ -187,4 +241,6 @@ if __name__ == "__main__":
     test_default_workbook_sheet_removed_when_creating_new_file()
     test_append_row_writes_at_max_row_plus_one()
     test_append_row_on_failed_scrape_writes_only_date_and_status()
+    test_append_ignores_phantom_empty_rows_from_formatting()
+    test_append_after_existing_data_ignores_further_phantom_rows()
     print("ALL PASS")
