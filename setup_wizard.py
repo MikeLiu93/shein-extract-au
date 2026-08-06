@@ -113,6 +113,7 @@ class Wizard:
             "submitted_dir": DEFAULT_SUBMITTED_DIR,
             "output_dir": "",
             "input_filename": "希音链接 - LU.xlsx",
+            "output_filename": "",
             "api_key": "",
         }
         self._load_existing()
@@ -136,6 +137,7 @@ class Wizard:
             "SHEIN_SUBMITTED_DIR": "submitted_dir",
             "SHEIN_OUTPUT_DIR": "output_dir",
             "SHEIN_INPUT_FILENAME": "input_filename",
+            "SHEIN_OUTPUT_FILENAME": "output_filename",
             "ANTHROPIC_API_KEY": "api_key",
         }
         for env_k, state_k in mapping.items():
@@ -209,12 +211,13 @@ class Wizard:
 
     def _step_paths(self):
         self._heading("路径设置")
-        self._para("确认或修改以下 3 项。")
+        self._para("确认或修改以下 4 项。")
 
         rows = [
             ("输入表所在目录", "submitted_dir", True),
             ("输出根目录（留空 = 与输入目录相同；店铺名自动作为子文件夹）", "output_dir", True),
-            ("指定输入文件名（可选；留空 = 处理目录下所有 .xlsx）", "input_filename", False),
+            ("主表(输入)文件名（必填，例: 澳洲希音链接 (输入) - ZR.xlsx）", "input_filename", False),
+            ("富表(输出)文件名（必填，例: 澳洲希音链接 (输出) - ZR.xlsx）", "output_filename", False),
         ]
         self._entries = {}
         for label, key, browseable in rows:
@@ -236,6 +239,12 @@ class Wizard:
             sd = Path(self.values["submitted_dir"])
             if not sd.is_dir():
                 messagebox.showerror("路径错误", f"输入目录不存在:\n{sd}")
+                return
+            if not self.values["input_filename"]:
+                messagebox.showerror("配置缺失", "请填写'主表(输入)文件名'。")
+                return
+            if not self.values["output_filename"]:
+                messagebox.showerror("配置缺失", "请填写'富表(输出)文件名'。")
                 return
             if not self.values["output_dir"]:
                 # 默认：输出根 = 输入目录。跑起来后会在这下面自动建 <店铺名>/
@@ -284,9 +293,9 @@ class Wizard:
         env_values = {
             "SHEIN_SUBMITTED_DIR": self.values["submitted_dir"],
             "SHEIN_OUTPUT_DIR": self.values["output_dir"],
+            "SHEIN_INPUT_FILENAME": self.values["input_filename"],
+            "SHEIN_OUTPUT_FILENAME": self.values["output_filename"],
         }
-        if self.values["input_filename"]:
-            env_values["SHEIN_INPUT_FILENAME"] = self.values["input_filename"]
         if self.values["api_key"]:
             env_values["ANTHROPIC_API_KEY"] = self.values["api_key"]
         try:

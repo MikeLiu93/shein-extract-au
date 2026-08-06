@@ -3,8 +3,8 @@ ebay.com.au via CDP browser (3-tab parallel), extract top-2 Best Match
 listings, and write delivered price + cleaned URL to columns N-R.
 
 Usage:
-    python ebay_price_check.py                  # picks SUBMITTED_DIR/SHEIN_INPUT_FILENAME
-    python ebay_price_check.py "path/to/x.xlsx" # explicit file
+    python ebay_price_check.py                  # picks SUBMITTED_DIR/SHEIN_OUTPUT_FILENAME (enriched)
+    python ebay_price_check.py "path/to/enriched.xlsx"  # explicit enriched file
 
 Columns written (see docs/superpowers/specs/2026-08-02-ebay-price-check-design.md):
     N: eBay 搜索日期    — YYYY-MM-DD
@@ -110,7 +110,7 @@ from shein_scraper import (
 )
 from notify import alert_captcha
 from ebay_scraper import search_ebay_au, _ensure_ebay_session
-from config import SUBMITTED_DIR, INPUT_FILENAME
+from config import SUBMITTED_DIR
 
 
 def setup_logging():
@@ -292,18 +292,18 @@ def main():
     parser = argparse.ArgumentParser(
         description="Post-Shein-scrape eBay price check helper (澳洲站)")
     parser.add_argument("file", nargs="?", default=None,
-                        help="Path to .xlsx (default: SHEIN_INPUT_FILENAME under SUBMITTED_DIR)")
+                        help="Path to enriched .xlsx (default: SHEIN_OUTPUT_FILENAME under SUBMITTED_DIR)")
     args = parser.parse_args()
 
     setup_logging()
 
+    from config import require_output_filename
+    output_name = require_output_filename()
+
     if args.file:
         xlsx_path = Path(args.file)
-    elif INPUT_FILENAME:
-        xlsx_path = SUBMITTED_DIR / INPUT_FILENAME
     else:
-        logger.error("No file given and SHEIN_INPUT_FILENAME not set in .env")
-        sys.exit(1)
+        xlsx_path = SUBMITTED_DIR / output_name
 
     if not xlsx_path.exists():
         logger.error("File not found: %s", xlsx_path)

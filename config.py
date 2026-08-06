@@ -55,3 +55,25 @@ OUTPUT_ROOT_2ND = Path(os.environ.get(
     "SHEIN_OUTPUT_DIR",
     _AU_BASE,  # 默认与 SUBMITTED_DIR 同级；店铺名自动作为下一级子文件夹
 ))
+
+# ── Enriched (输出) 文件名 ──────────────────────────────────────────────────
+# 主表(输入)与富表(输出)分开后新增。SHEIN_OUTPUT_FILENAME 必填，无默认。
+# 具体检查在使用点 (require_output_filename) 抛出，避免 config 载入即失败。
+OUTPUT_FILENAME = os.environ.get("SHEIN_OUTPUT_FILENAME", "").strip()
+
+
+def require_output_filename() -> str:
+    """Return OUTPUT_FILENAME or exit with a clear message.
+
+    Called by run_excel.py / ebay_price_check.py at startup — keeps
+    `import config` side-effect-free for test contexts."""
+    if not OUTPUT_FILENAME:
+        import sys
+        sys.stderr.write(
+            "错误: SHEIN_OUTPUT_FILENAME 未在 .env / config.env 中设置。\n"
+            "请重新运行 setup_wizard 并填写'输出表文件名'，或手动编辑\n"
+            "%APPDATA%\\shein-extract-au\\config.env 加一行\n"
+            "  SHEIN_OUTPUT_FILENAME=<你的输出表文件名.xlsx>\n"
+        )
+        sys.exit(1)
+    return OUTPUT_FILENAME
