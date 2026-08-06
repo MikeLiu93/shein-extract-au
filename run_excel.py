@@ -1,8 +1,12 @@
 """
 Excel-based pipeline (澳洲站): read pending URLs from the MASTER (input) .xlsx,
 scrape them, and APPEND results as new rows to the ENRICHED (output) .xlsx —
-one row per (product × run). Master is opened read-only; only enriched is
-saved. See docs/superpowers/specs/2026-08-04-master-enriched-split-design.md.
+one row per (product × run). Master is otherwise read-only; the ONE write
+the script does is flipping **Done** rows' F='Y' → 'N' after each sheet
+(acknowledgement). Failed and Delisted rows keep F='Y' so a subsequent run
+retries them automatically. Enriched grows history; a re-processed seq
+appears as multiple rows dated differently.
+See docs/superpowers/specs/2026-08-04-master-enriched-split-design.md.
 
 Usage:
     python run_excel.py                              # SUBMITTED_DIR/SHEIN_INPUT_FILENAME
@@ -121,8 +125,14 @@ def _read_master_pending_rows(ws) -> list[dict]:
 
 def _ensure_enriched_sheet(enriched_path, sheet_name: str):
     """Load or create the enriched workbook, then load or create the store
-    sheet with the 21-col header row. Returns (wb, ws). Raises ValueError if
-    a sheet exists with mismatched headers (prevents silent schema drift)."""
+    sheet with the 21-col header row. Returns (wb, ws).
+
+    Row 1 is script-owned: if any cell in row 1 disagrees with the canonical
+    EXPECTED_HEADERS, that cell is silently rewritten (self-heal). This
+    makes the script robust to typos, extra whitespace, missing headers, or
+    old partial-header files — the user only needs to know 'row 1 = headers'
+    without memorising 21 exact strings. Data rows (2+) are never touched
+    here (append happens elsewhere)."""
     from pathlib import Path
     from openpyxl import Workbook, load_workbook
 
@@ -138,15 +148,20 @@ def _ensure_enriched_sheet(enriched_path, sheet_name: str):
 
     if sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
-        # Validate headers on existing sheet — hard error on drift.
+        # Self-heal row 1: overwrite any cell that doesn't match the canonical
+        # header. Data rows below are preserved intact.
+        healed = []
         for ci, expected in enumerate(EXPECTED_HEADERS, 1):
             actual = ws.cell(1, ci).value
             if actual != expected:
-                raise ValueError(
-                    f"Enriched sheet '{sheet_name}' header mismatch at col {ci}: "
-                    f"expected {expected!r}, got {actual!r}. Fix the file or "
-                    f"delete the sheet to have it recreated."
-                )
+                ws.cell(1, ci).value = expected
+                healed.append((ci, actual, expected))
+        if healed:
+            logger.warning(
+                "  [self-heal] Enriched sheet '%s' row 1 was rewritten in %d cell(s). "
+                "Sample: col %d %r → %r",
+                sheet_name, len(healed), healed[0][0], healed[0][1], healed[0][2],
+            )
     else:
         ws = wb.create_sheet(sheet_name)
         for ci, header in enumerate(EXPECTED_HEADERS, 1):
@@ -340,13 +355,12 @@ def process_excel(master_path: Path, enriched_path: Path) -> None:
             os.chdir(old_cwd)
 
         # Open (or create) enriched sheet — one save per sheet at the end.
-        try:
-            enriched_wb, enriched_ws = _ensure_enriched_sheet(enriched_path, store)
-        except ValueError as e:
-            logger.error("  Cannot open enriched sheet '%s': %s", store, e)
-            continue
+        # (_ensure_enriched_sheet self-heals row 1 headers; no ValueError path.)
+        enriched_wb, enriched_ws = _ensure_enriched_sheet(enriched_path, store)
 
-        # Append one row per pending master row.
+        # Append one row per pending master row. Track which ones ended
+        # up 'Done' so we can flip only their F trigger to 'N' below.
+        done_rows = []
         for p in pending:
             seq = p["seq"]
             seq_folder = store_dir / str(seq)
@@ -372,22 +386,39 @@ def process_excel(master_path: Path, enriched_path: Path) -> None:
                 }
                 picture = rec.get("first_image_path") or None
                 _append_enriched_row(enriched_ws, p, result_dict, picture_path=picture)
+                done_rows.append(p)
                 logger.info("    seq %d → Done (appended row %d)", seq, enriched_ws.max_row)
             elif rec and rec.get("status") == "DELISTED":
                 _append_enriched_row(enriched_ws, p,
                                      {"date": today, "status": "Delisted"})
-                logger.info("    seq %d → Delisted", seq)
+                logger.info("    seq %d → Delisted (F stays Y — clear manually if not retrying)", seq)
             else:
                 detail = rec.get("status", "") if rec else ""
                 if is_bad_data:
                     detail = "no data loaded"
                 _append_enriched_row(enriched_ws, p,
                                      {"date": today, "status": "Failed"})
-                logger.info("    seq %d → Failed %s", seq,
+                logger.info("    seq %d → Failed %s (F stays Y for retry)", seq,
                             f"({detail})" if detail else "")
 
         safe_save(enriched_wb, enriched_path)
-        logger.info("  Saved enriched progress to %s", enriched_path.name)
+        logger.info("  Saved enriched progress to %s (sheet %r)",
+                    enriched_path.name, store)
+
+        # Flip master's F=Y → F=N ONLY for rows that ended up Done. Failed
+        # and Delisted rows keep F=Y so a subsequent run retries them
+        # automatically. This is the ONLY write the script does to the
+        # master (only F column, only Y→N direction).
+        if done_rows:
+            for p in done_rows:
+                master_ws.cell(p["row"], MASTER_COL_TRIGGER).value = "N"
+            safe_save(master_wb, master_path)
+            logger.info("  Flipped %d Done rows F=Y → N in master (sheet %r); "
+                        "%d Failed/Delisted kept Y for retry",
+                        len(done_rows), store, len(pending) - len(done_rows))
+        else:
+            logger.info("  No Done rows this sheet; master F unchanged "
+                        "(%d Failed/Delisted keep Y)", len(pending))
 
     master_wb.close()
     logger.info("Done.")
