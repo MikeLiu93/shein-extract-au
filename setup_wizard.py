@@ -213,7 +213,7 @@ class Wizard:
 
         rows = [
             ("输入表所在目录", "submitted_dir", True),
-            ("输出根目录（留空 = 自动用 输入目录\\上架资料-已完成）", "output_dir", True),
+            ("输出根目录（留空 = 与输入目录相同；店铺名自动作为子文件夹）", "output_dir", True),
             ("指定输入文件名（可选；留空 = 处理目录下所有 .xlsx）", "input_filename", False),
         ]
         self._entries = {}
@@ -238,7 +238,9 @@ class Wizard:
                 messagebox.showerror("路径错误", f"输入目录不存在:\n{sd}")
                 return
             if not self.values["output_dir"]:
-                self.values["output_dir"] = str(sd / "上架资料-已完成")
+                # 默认：输出根 = 输入目录。跑起来后会在这下面自动建 <店铺名>/
+                # 每个 xlsx 的每个 sheet 会成为一层子文件夹。
+                self.values["output_dir"] = str(sd)
             od = Path(self.values["output_dir"])
             try:
                 od.mkdir(parents=True, exist_ok=True)
