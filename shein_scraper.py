@@ -1451,62 +1451,140 @@ def _filter_variants_by_declaration(
 ) -> tuple[list, dict, list]:
     """Restrict sku_prices + variations to variants declared by the user.
 
-    Grammar of `declaration`:
+    Grammar of `declaration` (permissive — designed for messy real-world input):
       - Empty / whitespace → no filter; return inputs unchanged.
-      - No "/"             → flat allow-list; a SKU is kept if any of its
-                             attribute values matches (case/whitespace-insensitive).
-      - Contains "/"       → groups separated by "/", values within each group
-                             comma-separated. A SKU is kept only if EVERY
-                             non-empty group has at least one value equal to
-                             one of that SKU's attribute values.
+      - Groups separated by "/", values within a group by ",".
+      - Each value may optionally have an `Attribute:Value` (or `属性：值`,
+        full-width colon) prefix — the "Attribute:" part is stripped and
+        only "Value" is used for matching. E.g. `Color:Pink` → `Pink`.
+      - Values match SKU attrs via **token-set containment**: the user
+        value's token set must be a subset of the attr value's token set,
+        OR vice versa. Tokens = lowercase alphanumeric + CJK runs. So
+        `Pink` matches `Rose Pink` and `1PC Pink` but not `Pinkeye`.
+        `Rose Pink` matches `Pink`. Case + whitespace insensitive.
+      - Single-value attributes at product level (e.g. `variations = {"Color":
+        ["Pink"]}` when there's only 1 color) are treated as implicit on
+        every SKU — even though Shein omits them from per-SKU `attrs`.
+
+    Single group vs multi-group:
+      - Single group: SKU kept if any user value in the group matches any
+        of the SKU's (enriched) attr values.
+      - Multi-group: SKU kept iff every non-empty group has ≥1 match.
 
     Returns (kept_sku_prices, filtered_variations_dict, unknown_values_list).
-    `unknown_values_list` contains declared values that never matched any
-    scraped variant — caller logs a warning. When declaration was given
-    but nothing matched, kept is [] and filtered_variations is {}.
+    `unknown_values_list` contains declared values that never matched a
+    kept SKU — caller logs. When declaration was given but nothing
+    matched, kept is [] and filtered_variations is {}.
     """
     decl = (declaration or "").strip()
     if not decl:
         return sku_prices, variations, []
 
-    def _norm(s: str) -> str:
-        return re.sub(r"\s+", " ", (s or "")).strip().lower()
+    def _norm(s) -> str:
+        return re.sub(r"\s+", " ", str(s or "")).strip().lower()
 
-    groups = [
-        [_norm(v) for v in grp.split(",") if _norm(v)]
-        for grp in decl.split("/")
-    ]
-    groups = [g for g in groups if g]  # drop empty groups
-    if not groups:
+    def _norm_user(s) -> str:
+        """User values may have `Attribute:` or `属性：` prefix — strip it,
+        then lowercase + whitespace-collapse."""
+        v = str(s or "").strip()
+        # Strip prefix on either colon type. Split only once.
+        for sep in (":", "："):
+            if sep in v:
+                v = v.split(sep, 1)[1].strip()
+                break
+        return re.sub(r"\s+", " ", v).lower()
+
+    def _tokens(s: str) -> set:
+        """Lowercase alphanumeric + CJK runs (drops punctuation)."""
+        if not s:
+            return set()
+        return set(re.findall(r"[a-z0-9一-鿿]+", s.lower()))
+
+    def _value_matches(user_norm: str, attr_norm: str) -> bool:
+        """User matches attr if either's token-set is a subset of the other's.
+        Prevents false positives (Pink ≠ Pinkeye) while allowing loose match
+        (Pink matches 1PC Pink)."""
+        ut, at = _tokens(user_norm), _tokens(attr_norm)
+        if not ut or not at:
+            return False
+        return ut.issubset(at) or at.issubset(ut)
+
+    # Parse groups. Each raw value → (normalized-for-match, raw-for-reporting).
+    groups_norm: list[list[str]] = []
+    all_declared_norm: dict[str, str] = {}  # norm → user's raw form
+    for grp_raw in decl.split("/"):
+        grp_norm = []
+        for v_raw in grp_raw.split(","):
+            n = _norm_user(v_raw)
+            if n:
+                grp_norm.append(n)
+                all_declared_norm[n] = v_raw.strip()
+        if grp_norm:
+            groups_norm.append(grp_norm)
+
+    if not groups_norm:
         return sku_prices, variations, []
 
-    # all_declared_norm maps normalized-value → original-user-casing for reporting
-    all_declared_norm: dict[str, str] = {}
-    for grp in decl.split("/"):
-        for v in grp.split(","):
-            n = _norm(v)
-            raw = v.strip()
-            if n:
-                all_declared_norm[n] = raw
+    # Enrich each SKU with attribute values that live only at the product
+    # level (top-level `variations` dict) — Shein omits these from per-SKU
+    # `attrs` when the SPU-level dimension is fixed for this URL.
+    #
+    # Two flavours:
+    #   1. Single-value attr (`{"Color": ["Pink"]}`) — inject verbatim.
+    #   2. Multi-value attr (`{"Color": ["Green", "Pink", "White"]}` — a
+    #      SPU that spans 3 colors, each a separate URL). We can't tell
+    #      from sku_prices alone which color THIS URL is, but if the user's
+    #      declaration references one of those colors, we trust their hint
+    #      and inject that color into the SKU.
+    #
+    # If the user's declaration references a value that DOESN'T appear in
+    # any top-level attribute (e.g. Color:Blue on a Green/Pink/White SPU),
+    # no injection happens for that attribute → filter correctly rejects.
+    def _find_matching_value(values, all_declared_norm):
+        """Return the first value in `values` that matches any user-declared
+        value, or None."""
+        for v in values:
+            v_norm = _norm(v)
+            for u_norm in all_declared_norm:
+                if _value_matches(u_norm, v_norm):
+                    return v
+        return None
+
+    inject_attrs: dict[str, str] = {}
+    for attr_name, values in (variations or {}).items():
+        if not isinstance(values, list) or not values:
+            continue
+        if len(values) == 1:
+            inject_attrs[attr_name] = values[0]  # unconditional single-value inject
+        else:
+            match = _find_matching_value(values, all_declared_norm)
+            if match:
+                inject_attrs[attr_name] = match
+
+    def _sku_enriched_attrs(sku: dict) -> dict:
+        merged = dict(sku.get("attrs") or {})
+        for k, v in inject_attrs.items():
+            merged.setdefault(k, v)  # per-SKU value takes priority if present
+        return merged
 
     def _sku_matches(sku: dict) -> bool:
-        attr_values = {_norm(v) for v in (sku.get("attrs") or {}).values() if v}
-        if len(groups) == 1:
-            # Flat allow-list: any attribute value overlaps the group.
-            return bool(attr_values & set(groups[0]))
-        # Multi-group: every group must overlap this SKU's attribute values.
-        return all(bool(attr_values & set(g)) for g in groups)
+        attr_norms = [_norm(v) for v in _sku_enriched_attrs(sku).values() if v]
+        if len(groups_norm) == 1:
+            return any(_value_matches(u, a) for u in groups_norm[0] for a in attr_norms)
+        for group in groups_norm:
+            if not any(_value_matches(u, a) for u in group for a in attr_norms):
+                return False
+        return True
 
     kept = [s for s in sku_prices if _sku_matches(s)]
 
-    # Compute seen_norm from kept SKUs only (not from failed candidates) so
-    # declared values that appeared in rejected SKUs are still reported as unknown.
+    # Report unknowns: user values that didn't match any kept SKU's attrs.
     seen_norm: set[str] = set()
     for sp in kept:
-        for v in (sp.get("attrs") or {}).values():
-            n = _norm(v)
-            if n in all_declared_norm:
-                seen_norm.add(n)
+        attr_norms = [_norm(v) for v in _sku_enriched_attrs(sp).values() if v]
+        for u_norm in all_declared_norm:
+            if any(_value_matches(u_norm, a) for a in attr_norms):
+                seen_norm.add(u_norm)
 
     unseen_norm = set(all_declared_norm.keys()) - seen_norm
     unknown = sorted(all_declared_norm[n] for n in unseen_norm)
@@ -1514,8 +1592,7 @@ def _filter_variants_by_declaration(
     if not kept:
         return [], {}, sorted(all_declared_norm[n] for n in all_declared_norm)
 
-    # Rebuild variations dict from kept SKUs so downstream (title, txt, L col)
-    # sees only declared values in original scraper casing.
+    # Rebuild variations dict from kept SKUs' attrs + single-value carry-over.
     filtered_vars: dict[str, list] = {}
     for sp in kept:
         for k, v in (sp.get("attrs") or {}).items():
@@ -1524,15 +1601,28 @@ def _filter_variants_by_declaration(
             filtered_vars.setdefault(k, [])
             if v not in filtered_vars[k]:
                 filtered_vars[k].append(v)
-    # Preserve top-level variations keys that were flat (no per-SKU attrs) —
-    # rare but safe: keep any original key not covered by kept-SKU attrs, if
-    # its values overlap the declaration.
+    # Carry over injected attrs (single-value or user-hint-matched values).
+    # These represent the URL's specific variant for attributes Shein tracks
+    # at product level.
+    for k, v in inject_attrs.items():
+        if k not in filtered_vars:
+            filtered_vars[k] = [v]
+
+    # Fallback: multi-value top-level attrs that don't appear in per-SKU
+    # attrs (rare — happens when Shein tracks an attribute at the product
+    # level without splitting SKUs by it). Keep values that the user declared.
     for k, vals in (variations or {}).items():
         if k in filtered_vars:
             continue
         if not isinstance(vals, list):
             continue
-        keep = [v for v in vals if _norm(v) in all_declared_norm]
+        keep = []
+        for v in vals:
+            v_norm = _norm(v)
+            for u_norm in all_declared_norm:
+                if _value_matches(u_norm, v_norm):
+                    keep.append(v)
+                    break
         if keep:
             filtered_vars[k] = keep
 

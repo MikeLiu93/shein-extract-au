@@ -83,14 +83,10 @@ def test_zero_match_returns_empty_and_flags():
 
 
 def test_flat_variations_key_not_in_sku_attrs():
-    """Fallback path: a variations key that has no per-SKU attrs entry, but its
-    values overlap the declaration, should be kept in filtered_vars.
-
-    X1 only has a Color attr, so 'Material' is not in filtered_vars after the
-    kept-SKU loop. The fallback loop must look up 'Cotton' against
-    all_declared_norm.keys() to decide whether to keep it. The bug used the
-    undefined name `all_declared` instead of `all_declared_norm`, causing a
-    NameError on this path.
+    """A variations key with values but no per-SKU attrs entry: the user
+    hint enriches the SKU AND filtered_vars carries the matched value
+    forward. Cotton is a real product attribute that matched, so it should
+    NOT appear in unknown.
     """
     skus = [
         {"sku_code": "X1", "attrs": {"Color": "Black"}, "sale_price": 5.0, "stock": 1},
@@ -99,21 +95,18 @@ def test_flat_variations_key_not_in_sku_attrs():
         "Color": ["Black", "Red"],
         "Material": ["Cotton", "Wool"],
     }
-    # Flat (no "/") declaration: X1 matches because "Black" is in its attrs.
-    # "Cotton" is declared so the Material fallback should keep it.
+    # Flat (no "/") declaration: X1 matches (Black in attrs, and Cotton
+    # matched via variations enrichment).
     kept, vars_, unknown = _filter_variants_by_declaration(
         "Black, Cotton", skus, variations
     )
-    # X1 matches "Black".
     assert [s["sku_code"] for s in kept] == ["X1"]
     # Color rebuilt from X1's attrs.
     assert vars_.get("Color") == ["Black"]
-    # Material has no per-SKU entry; fallback keeps "Cotton" (declared), drops "Wool".
+    # Material carried over from the enrichment lookup.
     assert vars_.get("Material") == ["Cotton"]
-    # "Cotton" was declared but never matched a SKU's attr directly, so it
-    # appears in unknown. The fallback still adds it to filtered_vars, but
-    # unknown is computed before the fallback loop runs.
-    assert unknown == ["Cotton"]
+    # Both Black and Cotton were matched → unknown is empty.
+    assert unknown == []
 
 
 def test_multi_group_seen_leak_reports_unreachable_value():
@@ -132,6 +125,107 @@ def test_multi_group_seen_leak_reports_unreachable_value():
     assert "XL" not in unknown, f"XL wasn't declared; got unknown={unknown}"
 
 
+def test_attribute_prefix_stripped():
+    """User writes 'Color:Pink' (attribute-value form) — script must strip
+    the 'Color:' prefix and match 'Pink' against SKU attr values."""
+    kept, vars_, unknown = _filter_variants_by_declaration(
+        "Color:Black, Color:Red", SAMPLE_SKUS, SAMPLE_VARS
+    )
+    codes = [s["sku_code"] for s in kept]
+    assert codes == ["A1", "A2", "A3", "A4"], codes
+    assert unknown == []
+
+
+def test_full_width_colon_prefix_stripped():
+    """Chinese full-width colon (：) also acts as attribute separator."""
+    kept, vars_, unknown = _filter_variants_by_declaration(
+        "Color：Black", SAMPLE_SKUS, SAMPLE_VARS
+    )
+    assert [s["sku_code"] for s in kept] == ["A1", "A2"]
+
+
+def test_token_match_substring_pink_matches_1pc_pink():
+    """Token-set match: user 'Pink' matches Shein's '1PC Pink' (a common
+    Shein naming pattern for single-piece variants)."""
+    skus = [
+        {"sku_code": "X1", "attrs": {"Color": "1PC Pink"}, "sale_price": 5.0, "stock": 1},
+        {"sku_code": "X2", "attrs": {"Color": "1PC Rose Pink"}, "sale_price": 6.0, "stock": 1},
+        {"sku_code": "X3", "attrs": {"Color": "1PC Black"}, "sale_price": 5.0, "stock": 1},
+    ]
+    variations = {"Color": ["1PC Pink", "1PC Rose Pink", "1PC Black"]}
+    kept, vars_, unknown = _filter_variants_by_declaration("Pink", skus, variations)
+    codes = [s["sku_code"] for s in kept]
+    # Both X1 (1PC Pink) and X2 (1PC Rose Pink) contain 'pink' token → both match.
+    # X3 (1PC Black) does not.
+    assert codes == ["X1", "X2"], codes
+
+
+def test_token_match_not_pinkeye():
+    """Token-set match must NOT be raw substring — 'Pink' should not match
+    'Pinkeye' (different tokens, no subset relationship)."""
+    skus = [
+        {"sku_code": "P1", "attrs": {"Color": "Pinkeye"}, "sale_price": 5.0, "stock": 1},
+    ]
+    kept, _, _ = _filter_variants_by_declaration("Pink", skus, {"Color": ["Pinkeye"]})
+    assert kept == [], "Pink should NOT match Pinkeye (word-boundary safety)"
+
+
+def test_single_value_attribute_enriched_to_all_skus():
+    """AOYI-simple case: product has variations={'Color': ['Pink']} — one
+    color, one SKU with only Size attr. User declares 'Color:Pink' — script
+    enriches SKU with the implicit single-value Color and matches."""
+    skus = [
+        {"sku_code": "AOYI-1", "attrs": {"Size": "one-size"},
+         "sale_price": 13.25, "stock": 5},
+    ]
+    variations = {"Color": ["Pink"]}
+    kept, vars_, unknown = _filter_variants_by_declaration(
+        "Color:Pink", skus, variations
+    )
+    assert [s["sku_code"] for s in kept] == ["AOYI-1"]
+    assert vars_.get("Color") == ["Pink"]
+    assert vars_.get("Size") == ["one-size"]
+    assert unknown == []
+
+
+def test_multi_value_top_level_attr_uses_user_hint():
+    """AOYI-real case: product's `main_sale_attrs` expands variations to
+    {'Color': ['Green', 'Pink', 'White']} — 3 colors, each a separate URL.
+    Current URL is Pink (per Shein's main_sale_attrs) but sku_prices only
+    has {'Size': 'one-size'}. User declares 'Color:Pink' — script trusts
+    the user's hint and injects Color=Pink into the SKU (since 'Pink' IS
+    one of the variation values)."""
+    skus = [
+        {"sku_code": "AOYI-1", "attrs": {"Size": "one-size"},
+         "sale_price": 13.25, "stock": 5},
+    ]
+    variations = {"Color": ["Green", "Pink", "White"]}
+    kept, vars_, unknown = _filter_variants_by_declaration(
+        "Color:Pink", skus, variations
+    )
+    assert [s["sku_code"] for s in kept] == ["AOYI-1"], (
+        "Should match: user hinted Pink which is in variations")
+    assert vars_.get("Color") == ["Pink"]  # only the specific one, not all 3
+    assert unknown == []
+
+
+def test_multi_value_top_level_attr_rejects_when_user_hint_absent():
+    """Same AOYI product structure, but user declares a color that's NOT
+    in variations. No injection → filter fails → SKU rejected. Correct
+    behaviour: don't blindly trust user; require variations to list the
+    value they claimed."""
+    skus = [
+        {"sku_code": "AOYI-1", "attrs": {"Size": "one-size"},
+         "sale_price": 13.25, "stock": 5},
+    ]
+    variations = {"Color": ["Green", "Pink", "White"]}
+    kept, vars_, unknown = _filter_variants_by_declaration(
+        "Color:Blue", skus, variations
+    )
+    assert kept == [], "Blue isn't in variations → should reject"
+    assert "Color:Blue" in unknown
+
+
 if __name__ == "__main__":
     test_empty_declaration_returns_everything()
     test_two_groups_cartesian()
@@ -141,4 +235,11 @@ if __name__ == "__main__":
     test_zero_match_returns_empty_and_flags()
     test_flat_variations_key_not_in_sku_attrs()
     test_multi_group_seen_leak_reports_unreachable_value()
+    test_attribute_prefix_stripped()
+    test_full_width_colon_prefix_stripped()
+    test_token_match_substring_pink_matches_1pc_pink()
+    test_token_match_not_pinkeye()
+    test_single_value_attribute_enriched_to_all_skus()
+    test_multi_value_top_level_attr_uses_user_hint()
+    test_multi_value_top_level_attr_rejects_when_user_hint_absent()
     print("ALL PASS")
