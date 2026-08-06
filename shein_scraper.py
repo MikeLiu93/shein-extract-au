@@ -202,7 +202,8 @@ _JS_DETECT_BLOCK = r"""
     );
     // 检查是否有明显的登录弹窗覆盖了页面
     var modal = document.querySelector(
-        '.sui-dialog__wrapper, [class*="modal"][class*="login"], [class*="overlay"][class*="login"]'
+        '.sui-dialog__wrapper, [class*="modal"][class*="login"], [class*="overlay"][class*="login"], ' +
+        '.signin-container, [class*="signin"][class*="overlay"], [id*="signin"][class*="modal"]'
     );
     if (modal && modal.offsetHeight > 100) {
         result.blocked = true;
@@ -257,6 +258,9 @@ _JS_DISMISS_SIGNIN = r"""
         '[class*="popup"] [class*="close"]', '[aria-label="Close"]',
         '[class*="login"] [class*="close"]', '.she-close',
         'button[class*="close"]', '.icon-close',
+        // eBay signin/promo overlays
+        '[class*="signin"] [class*="close"]', '.mp-close', '.dlg-close',
+        'button[aria-label*="close" i]', '[data-testid*="close"]',
     ];
     for (var i = 0; i < closeSelectors.length; i++) {
         var els = document.querySelectorAll(closeSelectors[i]);
