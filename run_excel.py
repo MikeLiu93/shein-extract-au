@@ -162,6 +162,16 @@ def _ensure_enriched_sheet(enriched_path, sheet_name: str):
                 "Sample: col %d %r → %r",
                 sheet_name, len(healed), healed[0][0], healed[0][1], healed[0][2],
             )
+        # Compact: pull real data rows up so they sit right below the header.
+        # Fixes the 'output empty' UX where phantom empty rows (Excel format
+        # artifact) buried the data at row 1000+.
+        removed = _compact_data_rows(ws, key_col=1)
+        if removed:
+            logger.info(
+                "  [compact] Enriched sheet '%s': removed %d empty rows; "
+                "data now starts at row 2.",
+                sheet_name, removed,
+            )
     else:
         ws = wb.create_sheet(sheet_name)
         for ci, header in enumerate(EXPECTED_HEADERS, 1):
@@ -170,17 +180,56 @@ def _ensure_enriched_sheet(enriched_path, sheet_name: str):
     return wb, ws
 
 
+def _compact_data_rows(ws, key_col: int = 1) -> int:
+    """Remove every row between the header (row 1) and the last data row
+    where `key_col` (col A / 编号 by default) is empty. Modifies ws in
+    place. Returns number of rows deleted.
+
+    Why: user's fresh xlsx often has phantom empty rows extending far
+    past the header (Excel formatting artifact). Historical data ends
+    up appended after those phantom rows, buried at row 1000+. Compacting
+    on every open guarantees data stays glued to the header — operator
+    sees the whole picture without scrolling.
+
+    Header row 1 is preserved. Rows past the last data row (trailing
+    phantom formatting) are ALSO removed so `ws.max_row` doesn't drift
+    upward over time.
+    """
+    # Find the highest row with real data in key_col.
+    last_data = 1
+    for r in range(ws.max_row, 1, -1):
+        if ws.cell(r, key_col).value is not None:
+            last_data = r
+            break
+
+    removed = 0
+    # 1) Remove trailing empty rows past last data (rows [last_data+1 .. max_row]).
+    trailing_start = last_data + 1
+    if ws.max_row >= trailing_start:
+        n = ws.max_row - trailing_start + 1
+        ws.delete_rows(trailing_start, n)
+        removed += n
+
+    # 2) Remove empty rows between header and last data — bottom-up so
+    #    indices stay valid as we delete.
+    #    (After step 1, ws.max_row == last_data; but delete_rows may not
+    #    always update max_row atomically, so re-scan the range.)
+    for r in range(last_data, 1, -1):
+        if ws.cell(r, key_col).value is None:
+            ws.delete_rows(r, 1)
+            removed += 1
+
+    return removed
+
+
 def _next_data_row(ws, key_col: int = 1) -> int:
     """Return the row index to append the next data row to: 1 + the highest
     row with a non-None value in `key_col` (default col A = 编号). If no
     data rows yet, returns 2 (right after the header row).
 
-    Why not just `ws.max_row + 1`? openpyxl's max_row counts any row with
-    formatting (borders, colors, number-formats, merged cells, etc.), not
-    just data. A brand-new xlsx created by Excel often has phantom empty
-    rows extending to row 1000+ from the operator's initial formatting.
-    Appending at max_row+1 buries the first data at row 1001+, which
-    looks like an 'empty output file' to the operator (they don't scroll).
+    Assumes _compact_data_rows has already been called (no gaps between
+    header and last data row). Falls back safely if there are gaps by
+    scanning backward for the first non-empty key_col value.
     """
     for r in range(ws.max_row, 1, -1):
         if ws.cell(r, key_col).value is not None:

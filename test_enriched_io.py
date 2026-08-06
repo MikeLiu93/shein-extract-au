@@ -178,6 +178,75 @@ def test_append_row_on_failed_scrape_writes_only_date_and_status():
             assert ws.cell(2, c).value is None
 
 
+def test_compact_pulls_data_up_below_header():
+    """User's file has header + 990 empty rows + 10 data rows at 993-1002.
+    After compaction, data lands at rows 2-11 (glued to header) and
+    ws.max_row drops to 11.
+    """
+    from run_excel import _compact_data_rows
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "enriched.xlsx"
+        wb, ws = _ensure_enriched_sheet(p, "ZR1")
+        # Simulate user's messy file: 10 data rows starting at row 993.
+        for i, r in enumerate(range(993, 1003), start=1):
+            ws.cell(r, 1).value = i           # seq
+            ws.cell(r, 6).value = f"2026-08-0{i%9+1}"
+            ws.cell(r, 7).value = "Done"
+        assert ws.max_row >= 1002
+
+        removed = _compact_data_rows(ws, key_col=1)
+        # Removed 991 rows total: 991 empty rows between row 1 and row 1002.
+        assert removed == 991, removed
+        # Data now at rows 2-11.
+        assert ws.max_row == 11
+        for i, r in enumerate(range(2, 12), start=1):
+            assert ws.cell(r, 1).value == i, (
+                f"row {r} col A expected {i}, got {ws.cell(r,1).value!r}")
+
+
+def test_compact_removes_trailing_empty_formatting_only():
+    """When data starts right below header but trailing formatting extends
+    max_row past it, only the trailing empty rows are removed."""
+    from openpyxl.styles import Border, Side
+    from run_excel import _compact_data_rows
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "enriched.xlsx"
+        wb, ws = _ensure_enriched_sheet(p, "ZR1")
+        ws.cell(2, 1).value = 1
+        ws.cell(3, 1).value = 2
+        # Formatting at row 500 → bumps max_row to 500
+        ws.cell(500, 5).border = Border(top=Side(style="thin"))
+        assert ws.max_row >= 500
+
+        removed = _compact_data_rows(ws, key_col=1)
+        assert removed >= 495, removed
+        # Data still at rows 2-3
+        assert ws.cell(2, 1).value == 1
+        assert ws.cell(3, 1).value == 2
+
+
+def test_ensure_enriched_sheet_auto_compacts_on_open():
+    """_ensure_enriched_sheet compacts as part of opening — no separate call
+    needed. Verifies the end-to-end UX employees see."""
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "enriched.xlsx"
+        # Create a mock-messy file: headers + empty rows + late data.
+        wb0 = Workbook()
+        ws0 = wb0.active
+        ws0.title = "ZR1"
+        _write_headers(ws0, EXPECTED_HEADERS)
+        ws0.cell(500, 1).value = 42     # data buried at row 500
+        ws0.cell(500, 7).value = "Done"
+        wb0.save(p)
+
+        # Open via our helper — should auto-compact.
+        wb, ws = _ensure_enriched_sheet(p, "ZR1")
+        assert ws.cell(2, 1).value == 42, (
+            f"data not pulled up; row 2 col A = {ws.cell(2,1).value!r}")
+
+
 def test_append_ignores_phantom_empty_rows_from_formatting():
     """Reproduce the 'output empty' bug: operator's fresh xlsx has phantom
     empty rows extending far past the header (Excel formatting artifact).
@@ -241,6 +310,9 @@ if __name__ == "__main__":
     test_default_workbook_sheet_removed_when_creating_new_file()
     test_append_row_writes_at_max_row_plus_one()
     test_append_row_on_failed_scrape_writes_only_date_and_status()
+    test_compact_pulls_data_up_below_header()
+    test_compact_removes_trailing_empty_formatting_only()
+    test_ensure_enriched_sheet_auto_compacts_on_open()
     test_append_ignores_phantom_empty_rows_from_formatting()
     test_append_after_existing_data_ignores_further_phantom_rows()
     print("ALL PASS")
