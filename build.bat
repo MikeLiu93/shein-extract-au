@@ -58,7 +58,7 @@ if errorlevel 1 (
 
 if /i "%1"=="exe" (
     echo.
-    echo Skipping Inno Setup (--exe-only). dist\SheinExtractAU.exe is ready.
+    echo Skipping Inno Setup ^(--exe-only^). dist\SheinExtractAU.exe is ready.
     exit /b 0
 )
 
