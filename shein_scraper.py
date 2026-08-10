@@ -36,6 +36,7 @@ EXCEL COLUMNS:
   * 变体子行的 C 列 (SKU) 填写该变体的 sku_code
 """
 
+import gc
 import json
 import os
 import random
@@ -45,7 +46,9 @@ import subprocess
 import tempfile
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse, unquote, urlunparse
 
@@ -56,6 +59,7 @@ from notify import alert_captcha, alert_signin, alert_generic
 from openpyxl import Workbook
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
+from PIL import Image as PILImage
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple
@@ -1723,12 +1727,82 @@ def _picture_column_inner_width_px(ws, col: int) -> int:
     return max(24, int((wchars * 7.0 + 5.0) * 0.90))
 
 
+def save_workbook_atomic(wb, path) -> "Path":
+    """保存工作簿：先写同目录的临时文件 → 验证能打开 → 原子替换目标。
+
+    直接 `wb.save(目标)` 是危险的：openpyxl 流式写 zip，`[Content_Types].xml`
+    最后才写。保存中途抛异常（比如某张图读不到）会留下一个「有图片、没清单」
+    的半截文件，而原内容已经被覆盖 —— 员工的总表就是这么坏的。
+
+    临时文件放在同一个目录（同一卷）才能保证 os.replace 是原子的。
+    保存失败时目标文件一个字节都不会变，异常原样抛给调用方。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.stem}.tmp-{os.getpid()}-{threading.get_ident()}.xlsx")
+
+    err = _write_workbook_to_temp(wb, tmp)
+    if err is not None:
+        _discard_temp(tmp)
+        raise ExcelSaveError(f"{path.name} 保存失败（原文件未改动）: {err}")
+
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        _discard_temp(tmp)
+        raise
+    return path
+
+
+class ExcelSaveError(Exception):
+    """写临时文件阶段失败。目标文件保证没被动过。"""
+
+
+def _write_workbook_to_temp(wb, tmp: "Path") -> "str | None":
+    """把 wb 写进 tmp 并自检。成功返回 None，失败返回错误描述**字符串**。
+
+    故意不把异常对象抛出去：它的 traceback 会一直引用 openpyxl 那个没来得及
+    close 的 ZipFile，Windows 上就删不掉 tmp 了。只带走类型和消息。
+    """
+    try:
+        wb.save(tmp)
+        with zipfile.ZipFile(tmp) as z:
+            if z.testzip() is not None:
+                return "临时文件 zip 校验失败"
+            if "[Content_Types].xml" not in z.namelist():
+                return "临时文件缺少 [Content_Types].xml（只写了一半）"
+    except BaseException as e:
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+def _discard_temp(tmp: "Path") -> None:
+    for _ in range(3):
+        try:
+            if tmp.exists():
+                tmp.unlink()
+            return
+        except OSError:
+            gc.collect()
+
+
 def _add_picture_to_cell(ws, row: int, col: int, image_path: "Path") -> int:
     if not Path(image_path).is_file():
         return 0
     try:
-        xl_img = XLImage(str(image_path))
-    except Exception:
+        # 现在就把图片读进内存并转成 PNG，不要让 openpyxl 拿着路径等到
+        # wb.save() 再回磁盘重读 —— 那时候再失败就会写坏整个文件。
+        # 顺带解决 Excel 不认 webp 的问题（openpyxl 只放行 gif/jpeg/png）。
+        buf = BytesIO()
+        with PILImage.open(image_path) as im:
+            im.load()
+            if im.mode not in ("RGB", "RGBA", "L"):
+                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+            im.save(buf, format="PNG")
+        buf.seek(0)
+        xl_img = XLImage(buf)
+    except Exception as e:
+        print(f"  [图片] 跳过 {Path(image_path).name}: {type(e).__name__}: {e}")
         return 0
     ow, oh = max(1, int(xl_img.width)), max(1, int(xl_img.height))
     max_w = _picture_column_inner_width_px(ws, col)
@@ -2133,7 +2207,7 @@ def _save_excel(records, path):
             ws.cell(target_row, 1, seq_num)
 
     renumber_rows(ws, records)
-    wb.save(path)
+    save_workbook_atomic(wb, path)
 
 
 # ── AI-powered eBay title generation ──────────────────────────────────────────
