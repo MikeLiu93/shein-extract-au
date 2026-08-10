@@ -45,7 +45,8 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from shein_scraper import scrape_shein, RateLimitError, _add_picture_to_cell
+from shein_scraper import (scrape_shein, RateLimitError, _add_picture_to_cell,
+                           save_workbook_atomic)
 from config import SUBMITTED_DIR, OUTPUT_ROOT_2ND as OUTPUT_ROOT, INPUT_FILENAME
 
 logger = logging.getLogger("run_excel")
@@ -340,13 +341,18 @@ def setup_logging():
 
 
 def safe_save(wb, xlsx_path: Path) -> None:
-    """Save workbook. If locked by another user, save as copy with '2' suffix."""
+    """原子保存。被别人锁住（Excel 开着）时退回 '2' 后缀的副本。
+
+    走 save_workbook_atomic：先写同目录的临时文件、自检完整性，再原子替换。
+    保存中途失败时目标文件一个字节都不会变 —— 以前是直接 wb.save(目标)，
+    写到一半炸掉就会留下没有 [Content_Types].xml 的半截文件。
+    """
     try:
-        wb.save(xlsx_path)
+        save_workbook_atomic(wb, xlsx_path)
     except PermissionError:
         alt = xlsx_path.with_stem(xlsx_path.stem + "2")
         logger.warning("Cannot save to %s (locked), saving to %s", xlsx_path.name, alt.name)
-        wb.save(alt)
+        save_workbook_atomic(wb, alt)
         logger.info("Saved to alternate: %s", alt.name)
 
 
