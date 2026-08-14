@@ -162,7 +162,7 @@ def test_missing_image_file_is_skipped():
 
 
 def test_webp_is_converted_so_excel_can_show_it():
-    """Excel 不认 webp。嵌进去的必须已经是 png。"""
+    """Excel 不认 webp。嵌进去的必须是 Excel 支持的格式（现在是 jpg）。"""
     tmp = Path(tempfile.mkdtemp())
     try:
         img = _make_webp(tmp / "img_001.webp")
@@ -172,7 +172,34 @@ def test_webp_is_converted_so_excel_can_show_it():
         save_workbook_atomic(wb, target)
         media = [n for n in zipfile.ZipFile(target).namelist()
                  if n.startswith("xl/media/")]
-        assert media and all(n.lower().endswith(".png") for n in media), media
+        assert media and all(
+            n.lower().endswith((".jpg", ".jpeg", ".png", ".gif")) for n in media
+        ), media
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_embedded_image_is_compressed_not_full_resolution():
+    """1050×1050 原图不该原样嵌进去 —— 单张 embed 必须小于源文件。"""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        big = tmp / "img_big.webp"
+        # Shein 常见的 1050×1050 商品图，压 webp 后本身就有一定体积
+        PILImage.new("RGB", (1050, 1050), (30, 120, 200)).save(
+            big, format="WEBP", quality=95)
+        wb = Workbook()
+        _add_picture_to_cell(wb.active, 2, 8, big)
+        target = tmp / "out.xlsx"
+        save_workbook_atomic(wb, target)
+        z = zipfile.ZipFile(target)
+        media_infos = [i for i in z.infolist() if i.filename.startswith("xl/media/")]
+        assert len(media_infos) == 1, [i.filename for i in media_infos]
+        embed = media_infos[0]
+        # 目标是每张缩到 ~200×200 附近，JPEG q=80，一张远小于 50 KB
+        assert embed.file_size < 50_000, (
+            f"embedded image {embed.filename} = {embed.file_size} bytes "
+            f"— compression didn't kick in"
+        )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -206,5 +233,6 @@ if __name__ == "__main__":
     test_unreadable_image_is_skipped_not_raised()
     test_missing_image_file_is_skipped()
     test_webp_is_converted_so_excel_can_show_it()
+    test_embedded_image_is_compressed_not_full_resolution()
     test_many_images_all_land()
     print("ALL PASS")

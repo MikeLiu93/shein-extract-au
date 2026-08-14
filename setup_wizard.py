@@ -16,14 +16,10 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from chrome_finder import find_chrome as _shared_find_chrome
+
 USER_DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "shein-extract-au"
 CONFIG_FILE = USER_DATA_DIR / "config.env"
-
-CHROME_CANDIDATES = [
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-]
 
 # Default starting point for SUBMITTED_DIR — same default config.py uses
 DEFAULT_SUBMITTED_DIR = r"D:\共享云端硬盘\02 希音\澳洲站"
@@ -85,10 +81,8 @@ def mask_api_key(key: str) -> str:
 
 
 def find_chrome() -> str | None:
-    for p in CHROME_CANDIDATES:
-        if Path(p).exists():
-            return p
-    return None
+    """Delegate to chrome_finder — kept here so tests can monkeypatch this name."""
+    return _shared_find_chrome()
 
 
 # ── Wizard (Tkinter) ─────────────────────────────────────────────────────────
@@ -204,7 +198,12 @@ class Wizard:
             self._nav(on_next=self._next)
         else:
             ttk.Label(self.frame,
-                      text="✗ 未找到 Chrome —— 请先装 https://www.google.com/chrome/ 再重开向导。",
+                      text=(
+                          "✗ 未找到 Chrome。\n"
+                          "  · 常规做法：装 https://www.google.com/chrome/ 后重开向导。\n"
+                          "  · 如果 Chrome 已装在非标准路径（便携版、D 盘等），\n"
+                          "    设环境变量 SHEIN_CHROME_PATH 指向 chrome.exe 后重开向导。"
+                      ),
                       foreground="red", font=("Microsoft YaHei", 10),
                       wraplength=620, justify="left").pack(anchor="w", pady=4)
             self._nav(on_next=None)

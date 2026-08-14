@@ -105,14 +105,7 @@ def _inter_url_pause(i: int, total: int) -> None:
     time.sleep(INTER_URL_DELAY_SEC)
 
 
-_CHROME_PATHS = [
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-    os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"),
-    os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-]
+from chrome_finder import find_chrome as _find_chrome_shared, searched_locations as _chrome_searched_locations
 
 
 class RateLimitError(Exception):
@@ -897,11 +890,14 @@ _JS = r"""
 # ── Chrome launcher ───────────────────────────────────────────────────────────
 
 def _find_chrome():
-    for path in _CHROME_PATHS:
-        if os.path.exists(path):
-            return path
+    path = _find_chrome_shared()
+    if path:
+        return path
     raise RuntimeError(
-        "Chrome not found. Searched:\n" + "\n".join(f"  {p}" for p in _CHROME_PATHS)
+        "Chrome not found. Searched:\n"
+        + "\n".join(f"  {p}" for p in _chrome_searched_locations())
+        + "\n\n提示：如果 Chrome 装在非标准路径（便携版、D 盘等），"
+          "设环境变量 SHEIN_CHROME_PATH 指向 chrome.exe 后重试。"
     )
 
 
@@ -1789,24 +1785,34 @@ def _discard_temp(tmp: "Path") -> None:
 def _add_picture_to_cell(ws, row: int, col: int, image_path: "Path") -> int:
     if not Path(image_path).is_file():
         return 0
+    max_w = _picture_column_inner_width_px(ws, col)
+    max_h = PICTURE_MAX_HEIGHT_PX
     try:
-        # 现在就把图片读进内存并转成 PNG，不要让 openpyxl 拿着路径等到
-        # wb.save() 再回磁盘重读 —— 那时候再失败就会写坏整个文件。
+        # 现在就把字节读进内存 —— 不要让 openpyxl 拿着路径等到 wb.save()
+        # 再回磁盘重读，那时候再失败就会写坏整个文件。
         # 顺带解决 Excel 不认 webp 的问题（openpyxl 只放行 gif/jpeg/png）。
-        buf = BytesIO()
+        # 尺寸砍到 ~2× 单元格显示大小，编码用 JPEG（q=80）—— 原图 1050×1050
+        # PNG 一张约 1 MB，60 行的富表能撑到 60 MB；压完后 60 行只有 ~1 MB。
         with PILImage.open(image_path) as im:
             im.load()
-            if im.mode not in ("RGB", "RGBA", "L"):
-                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
-            im.save(buf, format="PNG")
+            # JPEG 不支持透明；alpha 通道先合成到白底。
+            if im.mode == "P":
+                im = im.convert("RGBA")
+            if "A" in im.getbands():
+                bg = PILImage.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[-1])
+                im = bg
+            elif im.mode != "RGB":
+                im = im.convert("RGB")
+            im.thumbnail((max_w * 2, max_h * 2))
+            buf = BytesIO()
+            im.save(buf, format="JPEG", quality=80, optimize=True, progressive=True)
         buf.seek(0)
         xl_img = XLImage(buf)
     except Exception as e:
         print(f"  [图片] 跳过 {Path(image_path).name}: {type(e).__name__}: {e}")
         return 0
     ow, oh = max(1, int(xl_img.width)), max(1, int(xl_img.height))
-    max_w = _picture_column_inner_width_px(ws, col)
-    max_h = PICTURE_MAX_HEIGHT_PX
     scale = min(max_w / ow, max_h / oh, 1.0)
     nw, nh = max(1, int(ow * scale)), max(1, int(oh * scale))
     xl_img.width = nw
