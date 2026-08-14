@@ -50,6 +50,7 @@ a = Analysis(
         'setup_wizard',
         'update_check',
         'auth',
+        'chrome_finder',
         'version',
         # Optional — only present after make_key_store.py ran
         'key_store',
