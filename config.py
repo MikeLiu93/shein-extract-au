@@ -3,11 +3,13 @@ Path + env config for the Shein extract pipeline (澳洲站分支). Reads .env o
 
 设计原则
 ========
-所有"用户决定"的路径都通过 .env 配置：
+所有"用户决定"的路径和数值都通过 .env / config.env 配置：
 
     SHEIN_SUBMITTED_DIR  — 输入 Excel 所在目录（共享盘上）
     SHEIN_INPUT_FILENAME — 输入 Excel 文件名（可选；不设则处理目录下所有 .xlsx）
-    SHEIN_OUTPUT_DIR     — 输出根目录（共享盘上）
+    SHEIN_OUTPUT_DIR     — 输出根目录（per-seq 媒体落这里，共享盘上）
+    SHEIN_BACKUP_DIR     — 备份根目录（每次跑前把输入表复制一份到这里）
+    SHEIN_EBAY_MARKUP    — eBay 定价系数（默认 1.2；员工在向导里改）
     ANTHROPIC_API_KEY    — Claude Haiku key（AI 标题）
 
 进程环境优先级 > .env 文件 > 默认值。
@@ -56,24 +58,15 @@ OUTPUT_ROOT_2ND = Path(os.environ.get(
     _AU_BASE,  # 默认与 SUBMITTED_DIR 同级；店铺名自动作为下一级子文件夹
 ))
 
-# ── Enriched (输出) 文件名 ──────────────────────────────────────────────────
-# 主表(输入)与富表(输出)分开后新增。SHEIN_OUTPUT_FILENAME 必填，无默认。
-# 具体检查在使用点 (require_output_filename) 抛出，避免 config 载入即失败。
-OUTPUT_FILENAME = os.environ.get("SHEIN_OUTPUT_FILENAME", "").strip()
+# 备份根目录：每次跑前把输入表复制一份到这里；空字符串 = 用 <SUBMITTED_DIR>/_backups
+_backup_env = os.environ.get("SHEIN_BACKUP_DIR", "").strip()
+BACKUP_DIR = Path(_backup_env) if _backup_env else SUBMITTED_DIR / "_backups"
 
+# ── eBay 定价 & 运费 ─────────────────────────────────────────────────────────
+# eBay 价格公式：Price × EBAY_MARKUP + Shipping。系数默认 1.2，员工在向导里改。
+EBAY_MARKUP = float(os.environ.get("SHEIN_EBAY_MARKUP", "1.2"))
 
-def require_output_filename() -> str:
-    """Return OUTPUT_FILENAME or exit with a clear message.
-
-    Called by run_excel.py / ebay_price_check.py at startup — keeps
-    `import config` side-effect-free for test contexts."""
-    if not OUTPUT_FILENAME:
-        import sys
-        sys.stderr.write(
-            "错误: SHEIN_OUTPUT_FILENAME 未在 .env / config.env 中设置。\n"
-            "请重新运行 setup_wizard 并填写'输出表文件名'，或手动编辑\n"
-            "%APPDATA%\\shein-extract-au\\config.env 加一行\n"
-            "  SHEIN_OUTPUT_FILENAME=<你的输出表文件名.xlsx>\n"
-        )
-        sys.exit(1)
-    return OUTPUT_FILENAME
+# 澳洲站 Standard shipping：价格 ≥ FREE_SHIPPING_THRESHOLD 免运，否则收
+# DEFAULT_SHIPPING_FEE。表格 D 列的手动运费在 run_excel.py 一层做覆盖。
+DEFAULT_SHIPPING_FEE    = float(os.environ.get("SHEIN_AU_SHIPPING_FEE", "7.95"))
+FREE_SHIPPING_THRESHOLD = float(os.environ.get("SHEIN_AU_FREE_SHIP_MIN", "9.0"))
