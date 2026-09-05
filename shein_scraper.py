@@ -66,10 +66,10 @@ from openpyxl.utils.cell import coordinate_to_tuple
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────
-# 澳洲站 Standard shipping：默认 AU$7.95（假设货单价不满足免运费 ≥ AU$9 的条件）。
-DEFAULT_SHIPPING_FEE   = float(os.environ.get("SHEIN_AU_SHIPPING_FEE", "7.95"))
-# eBay 价格公式：Price × MARKUP + Shipping（无最低 subtotal、无 max() 兜底）。
-EBAY_MARKUP            = float(os.environ.get("SHEIN_EBAY_MARKUP", "2.0"))
+# 运费 & 定价系数都从 config 拿，那边负责先把 config.env 载进 os.environ。
+# 直接在这里 os.environ.get() 会在 config._load_env_file() 之前触发，读不到员工
+# 在向导里改过的值 —— 得让 config 做门面。
+from config import EBAY_MARKUP, DEFAULT_SHIPPING_FEE, FREE_SHIPPING_THRESHOLD
 CDP_PORT               = 9223
 PAGE_LOAD_MIN_WAIT     = 3        # 最少等待秒数（让 JS 初始化）
 PAGE_LOAD_MAX_WAIT     = 20       # 最多等待秒数（轮询 goods_sn）
@@ -152,19 +152,6 @@ _JS_POLL = r"""
         const gs = window?.gbData?.detail?.goods_sn || window?.ProductDetailData?.detail?.goods_sn;
         if (gs) return gs;
     } catch(e) {}
-    return null;
-})()
-"""
-
-# ── JavaScript: 轮询运费面板是否已渲染 ───────────────────────────────────────
-_JS_POLL_SHIPPING = r"""
-(function(){
-    const el = document.querySelector('.productShippingNewContent__postage-text')
-            || document.querySelector('[class*="postage-text"]');
-    const t = el ? (el.innerText || '').trim() : '';
-    if (!t) return null;
-    // 必须包含 'shipping' 或货币符号才算真正渲染完成（避免空 span）
-    if (/shipping|free|\$\s*\d/i.test(t)) return t;
     return null;
 })()
 """
@@ -296,14 +283,6 @@ _JS = r"""
                /\$[\d.]+/.test(el.innerText || ''));
     const pm = (priceEl?.innerText || '').match(/([\d.]+)/);
     out.price = pm ? parseFloat(pm[1]) : null;
-    const shipEl = document.querySelector('.productShippingNewContent__postage-text')
-                || document.querySelector('[class*="postage-text"]');
-    const shipText = (shipEl?.innerText || '').trim();
-    out.shipping_raw       = shipText;
-    // \u9608\u503c\u5141\u8bb8 $ / AU$ / US$ \u7b49\u524d\u7f00\uff08\u6fb3\u6d32\u7ad9\u6587\u672c\u4e3a "Orders \u2265 AU$9.00"\uff09
-    const threshM          = shipText.match(/orders?\s*(?:>=|\u2265)\s*[A-Z]{0,3}\$\s*([\d.]+)/i);
-    out.free_threshold     = threshM ? parseFloat(threshM[1]) : null;
-    out.unconditional_free = /free\s*shipping/i.test(shipText) && !threshM;
     out.website = 'au.shein.com';
     out.variations = {};
 
@@ -1074,26 +1053,6 @@ def _wait_for_page_ready(port, tab_id, min_wait=PAGE_LOAD_MIN_WAIT,
     return None, _ws_url_for_id(port, tab_id)
 
 
-def _wait_for_shipping_text(port, tab_id, max_wait=8.0, poll=0.5):
-    """运费面板异步渲染，等它出现后再提取，最多等 max_wait 秒。
-    没等到也不报错，返回 None — _calc_shipping 会按"无运费信息→免运费"处理。"""
-    ws_url = _ws_url_for_id(port, tab_id)
-    elapsed = 0.0
-    while elapsed < max_wait:
-        try:
-            val = _run_js(ws_url, _JS_POLL_SHIPPING)
-            if val:
-                print(f"  运费面板就绪（额外等待 {elapsed:.1f}s）：{val[:80]}")
-                return val
-        except Exception:
-            pass
-        time.sleep(poll)
-        elapsed += poll
-        ws_url = _ws_url_for_id(port, tab_id)
-    print(f"  运费面板未渲染（等待 {max_wait}s）— 按无运费信息处理（免运费）")
-    return None
-
-
 _SHEIN_REFERRER = "https://au.shein.com/"
 
 # Anti-detection JS injected before every page load
@@ -1322,25 +1281,12 @@ def _shein_page_needs_retry(data) -> bool:
 
 # ── Shipping & pricing ────────────────────────────────────────────────────────
 
-def _calc_shipping(data):
-    """澳洲站 Standard shipping 规则：
-    - 检测到阈值（Orders ≥ AU$X）：price ≥ X → 免运费；否则收 DEFAULT_SHIPPING_FEE
-    - 无条件 'Free Shipping'：免运费
-    - 完全找不到运费信息：默认免运费（保守，用户指示）
-    """
-    price     = data.get("price") or 0.0
-    threshold = data.get("free_threshold")
-    uncon     = data.get("unconditional_free", False)
-    raw       = (data.get("shipping_raw") or "").strip()
-    if uncon:
-        return 0.0
-    if threshold is not None:
-        return 0.0 if float(price) >= float(threshold) else DEFAULT_SHIPPING_FEE
-    if not raw:
-        # 找不到运费信息 → 视为免运费
-        return 0.0
-    # 有运费文字但解析不出阈值 → 假设运费存在
-    return DEFAULT_SHIPPING_FEE
+def _calc_shipping(price) -> float:
+    """澳洲站 Standard shipping：price ≥ FREE_SHIPPING_THRESHOLD 免运，
+    否则统一收 DEFAULT_SHIPPING_FEE。以前会去爬运费面板；改成硬规则后员工不用
+    再等运费面板异步渲染，脚本也更快。表格 D 列的手动运费在 run_excel.py 一层
+    做覆盖，走到这里的都是没手动填的行。"""
+    return 0.0 if float(price or 0) >= FREE_SHIPPING_THRESHOLD else DEFAULT_SHIPPING_FEE
 
 
 def _ebay_listing_price(price: float, shipping: float) -> float:
@@ -1862,17 +1808,8 @@ def _expand_records(records: list) -> list:
         variations = rec.get("variations") or {}
         shipping = rec.get("shipping") or 0.0
         main_sale_attrs = rec.get("main_sale_attrs") or []
-        # 父记录上的运费上下文 — 给每个变体单独算运费（变体价格可能跨阈值）
-        _rec_ship_ctx = {
-            "shipping_raw":       rec.get("shipping_raw") or "",
-            "free_threshold":     rec.get("free_threshold"),
-            "unconditional_free": rec.get("unconditional_free", False),
-        }
-
-        def _variant_shipping(variant_price):
-            ctx = dict(_rec_ship_ctx)
-            ctx["price"] = variant_price
-            return _calc_shipping(ctx)
+        # 每个变体单独算运费（变体价格可能跨阈值）—— 现在是纯 price 函数。
+        _variant_shipping = _calc_shipping
 
         # 构建 颜色值 → goods_sn 映射（mainSaleAttribute 中每个颜色是独立商品）
         color_to_goodssn = {}
@@ -2492,13 +2429,7 @@ def _write_ebay_listing_txt(rec: dict, media_folder) -> "Path | None":
                 continue
             sale_f = float(sale)
             # 按变体价格单独算运费（可能跨阈值）
-            ctx = {
-                "price": sale_f,
-                "shipping_raw": rec.get("shipping_raw") or "",
-                "free_threshold": rec.get("free_threshold"),
-                "unconditional_free": rec.get("unconditional_free", False),
-            }
-            variant_ship = _calc_shipping(ctx)
+            variant_ship = _calc_shipping(sale_f)
             ebay_var = _ebay_listing_price(sale_f, variant_ship)
             attr_str = ", ".join(f"{k}: {v}" for k, v in attrs.items() if v)
             if stock == 0:
@@ -2959,9 +2890,6 @@ def _scrape_one_url(
                 data = None
                 break
 
-            if attempt == 0:
-                _wait_for_shipping_text(CDP_PORT, tab_id, max_wait=8.0)
-                ws_url = _ws_url_for_id(CDP_PORT, tab_id)
             print("  extracting...")
             data = _run_js(ws_url, _JS)
             if isinstance(data, dict) and not _shein_page_needs_retry(data):
@@ -3006,28 +2934,18 @@ def _scrape_one_url(
                   f"(网页=${(web_price or 0):.2f}, "
                   f"sku_prices×{len(data.get('sku_prices') or [])} 同步)")
 
+        price = data.get("price") or 0.0
         if override_shipping is not None:
             shipping = float(override_shipping)
             ship_note = f"template D=${shipping:.2f} (override)"
         else:
-            shipping = _calc_shipping(data)
-            ship_note = None
-        price = data.get("price") or 0.0
-        ebay  = _ebay_listing_price(price, shipping)
-        thresh = data.get("free_threshold")
-        if ship_note is None:
-            if data.get("unconditional_free"):
-                ship_note = "unconditional FREE shipping"
-            elif thresh is not None:
-                ship_note = (
-                    f"threshold AU${thresh:.2f} — price AU${price:.2f} "
-                    + ("≥ threshold → FREE" if price >= thresh
-                       else f"< threshold → AU${DEFAULT_SHIPPING_FEE}")
-                )
-            elif not (data.get("shipping_raw") or "").strip():
-                ship_note = "no shipping info on page → assumed FREE"
-            else:
-                ship_note = f"shipping text present but no threshold → AU${DEFAULT_SHIPPING_FEE}"
+            shipping = _calc_shipping(price)
+            ship_note = (
+                f"price AU${price:.2f} ≥ {FREE_SHIPPING_THRESHOLD:g} → FREE"
+                if shipping == 0.0
+                else f"price AU${price:.2f} < {FREE_SHIPPING_THRESHOLD:g} → AU${DEFAULT_SHIPPING_FEE}"
+            )
+        ebay = _ebay_listing_price(price, shipping)
 
         sku_prices = data.get("sku_prices") or []
         _wp_disp = _format_price_range(sku_prices)
@@ -3040,9 +2958,6 @@ def _scrape_one_url(
             "web_price_display": _wp_disp,
             "stock_summary":    _format_stock_summary(sku_prices),
             "shipping":         shipping,
-            "shipping_raw":     data.get("shipping_raw") or "",
-            "free_threshold":   data.get("free_threshold"),
-            "unconditional_free": data.get("unconditional_free", False),
             "website":          "au.shein.com",
             "store_name":       data.get("store_name", ""),
             "original_title":   data.get("title", ""),

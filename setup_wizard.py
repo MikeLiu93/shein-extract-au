@@ -5,7 +5,7 @@ Writes %APPDATA%\\shein-extract-au\\config.env with the user's choices.
 Steps:
   1. Welcome
   2. System check (Chrome)
-  3. Path config (3 fields)
+  3. Path + pricing config (5 rows)
   4. Anthropic API key
   5. Done (write config.env)
 """
@@ -23,6 +23,10 @@ CONFIG_FILE = USER_DATA_DIR / "config.env"
 
 # Default starting point for SUBMITTED_DIR — same default config.py uses
 DEFAULT_SUBMITTED_DIR = r"D:\共享云端硬盘\02 希音\澳洲站"
+
+# 定价系数常用值 —— Combobox 预设，员工也可以自己敲一个数进去。
+MARKUP_PRESETS = ("1.2", "1.5", "2.0")
+DEFAULT_MARKUP = "1.2"
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────
 
@@ -85,6 +89,21 @@ def find_chrome() -> str | None:
     return _shared_find_chrome()
 
 
+def _default_backup_dir(submitted_dir: str) -> str:
+    """Employees rarely have a specific place in mind — default to a hidden
+    `_backups` subfolder in whatever they typed for the input dir."""
+    return str(Path(submitted_dir) / "_backups") if submitted_dir else ""
+
+
+def _validate_markup(raw: str) -> float | None:
+    """Combobox accepts free-form text. Return a positive float or None."""
+    try:
+        v = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
 # ── Wizard (Tkinter) ─────────────────────────────────────────────────────────
 
 
@@ -92,7 +111,7 @@ class Wizard:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("SHEIN 上架工具 AU — 配置")
-        self.root.geometry("680x500")
+        self.root.geometry("720x560")
         self.root.resizable(False, False)
         try:
             self.root.attributes("-topmost", True)
@@ -106,8 +125,9 @@ class Wizard:
         self.values = {
             "submitted_dir": DEFAULT_SUBMITTED_DIR,
             "output_dir": "",
-            "input_filename": "希音链接 - LU.xlsx",
-            "output_filename": "",
+            "backup_dir": "",
+            "input_filename": "澳洲希音链接 - ZR.xlsx",
+            "ebay_markup": DEFAULT_MARKUP,
             "api_key": "",
         }
         self._load_existing()
@@ -130,8 +150,9 @@ class Wizard:
         mapping = {
             "SHEIN_SUBMITTED_DIR": "submitted_dir",
             "SHEIN_OUTPUT_DIR": "output_dir",
+            "SHEIN_BACKUP_DIR": "backup_dir",
             "SHEIN_INPUT_FILENAME": "input_filename",
-            "SHEIN_OUTPUT_FILENAME": "output_filename",
+            "SHEIN_EBAY_MARKUP": "ebay_markup",
             "ANTHROPIC_API_KEY": "api_key",
         }
         for env_k, state_k in mapping.items():
@@ -162,7 +183,7 @@ class Wizard:
         ttk.Separator(self.frame, orient="horizontal").pack(fill="x", pady=(0, 12))
 
     def _para(self, text):
-        ttk.Label(self.frame, text=text, wraplength=620, justify="left",
+        ttk.Label(self.frame, text=text, wraplength=660, justify="left",
                   font=("Microsoft YaHei", 10)).pack(anchor="w", pady=(0, 8))
 
     def _nav(self, on_next=None, next_text="下一步", show_back=True):
@@ -183,7 +204,7 @@ class Wizard:
     def _step_welcome(self):
         self._heading("SHEIN 上架工具 AU — 配置")
         self._para(
-            "这个向导帮你配置输入/输出目录和 API key（约 1-2 分钟）。\n\n"
+            "这个向导帮你配置路径、定价系数、API key（约 1-2 分钟）。\n\n"
             "你已经配置过的值会预填进来。点【开始】继续。"
         )
         self._nav(on_next=self._next, next_text="开始", show_back=False)
@@ -194,7 +215,7 @@ class Wizard:
         if chrome:
             ttk.Label(self.frame, text=f"✓ 找到 Chrome：{chrome}",
                       foreground="green", font=("Microsoft YaHei", 10),
-                      wraplength=620, justify="left").pack(anchor="w", pady=4)
+                      wraplength=660, justify="left").pack(anchor="w", pady=4)
             self._nav(on_next=self._next)
         else:
             ttk.Label(self.frame,
@@ -205,32 +226,49 @@ class Wizard:
                           "    设环境变量 SHEIN_CHROME_PATH 指向 chrome.exe 后重开向导。"
                       ),
                       foreground="red", font=("Microsoft YaHei", 10),
-                      wraplength=620, justify="left").pack(anchor="w", pady=4)
+                      wraplength=660, justify="left").pack(anchor="w", pady=4)
             self._nav(on_next=None)
 
     def _step_paths(self):
-        self._heading("路径设置")
-        self._para("确认或修改以下 4 项。")
+        self._heading("路径与定价")
+        self._para(
+            "确认以下 5 项。备份目录留空 = 用 <输入目录>/_backups。"
+            "eBay 定价系数是 eBay 上架价的乘数：价格 = 希音原价 × 系数 + 运费。"
+        )
+
+        # Backup dir default derives from submitted_dir if user hasn't set it yet.
+        if not self.values.get("backup_dir"):
+            self.values["backup_dir"] = _default_backup_dir(self.values["submitted_dir"])
 
         rows = [
-            ("输入表所在目录", "submitted_dir", True),
-            ("输出根目录（留空 = 与输入目录相同；店铺名自动作为子文件夹）", "output_dir", True),
-            ("主表(输入)文件名（必填，例: 澳洲希音链接 (输入) - ZR.xlsx）", "input_filename", False),
-            ("富表(输出)文件名（必填，例: 澳洲希音链接 (输出) - ZR.xlsx）", "output_filename", False),
+            ("输入表所在目录", "submitted_dir", "browse"),
+            ("输入表文件名", "input_filename", "entry"),
+            ("输出根目录（媒体文件落这里；留空 = 与输入目录相同）",
+             "output_dir", "browse"),
+            ("备份目录（每次跑前把输入表备份到这里）", "backup_dir", "browse"),
+            ("eBay 定价系数", "ebay_markup", "combo"),
         ]
         self._entries = {}
-        for label, key, browseable in rows:
+        for label, key, kind in rows:
             row = ttk.Frame(self.frame)
             row.pack(fill="x", pady=4)
-            ttk.Label(row, text=label, width=30, anchor="w",
+            ttk.Label(row, text=label, width=32, anchor="w",
                       font=("Microsoft YaHei", 10)).pack(side="left")
-            var = tk.StringVar(value=self.values.get(key, ""))
-            ttk.Entry(row, textvariable=var, font=("Consolas", 9)).pack(
-                side="left", fill="x", expand=True, padx=4)
+            var = tk.StringVar(value=str(self.values.get(key, "")))
+            if kind == "combo":
+                cb = ttk.Combobox(row, textvariable=var, values=MARKUP_PRESETS,
+                                  font=("Consolas", 9), width=12)
+                cb.pack(side="left", padx=4)
+                ttk.Label(row, text="  （常用 1.2 / 1.5 / 2.0，也可自填）",
+                          foreground="#666", font=("Microsoft YaHei", 9)
+                          ).pack(side="left")
+            else:
+                ttk.Entry(row, textvariable=var, font=("Consolas", 9)).pack(
+                    side="left", fill="x", expand=True, padx=4)
+                if kind == "browse":
+                    ttk.Button(row, text="浏览...",
+                               command=lambda v=var: self._browse(v)).pack(side="left")
             self._entries[key] = var
-            if browseable:
-                ttk.Button(row, text="浏览...",
-                           command=lambda v=var: self._browse(v)).pack(side="left")
 
         def on_next():
             for k, var in self._entries.items():
@@ -240,14 +278,9 @@ class Wizard:
                 messagebox.showerror("路径错误", f"输入目录不存在:\n{sd}")
                 return
             if not self.values["input_filename"]:
-                messagebox.showerror("配置缺失", "请填写'主表(输入)文件名'。")
-                return
-            if not self.values["output_filename"]:
-                messagebox.showerror("配置缺失", "请填写'富表(输出)文件名'。")
+                messagebox.showerror("配置缺失", "请填写「输入表文件名」。")
                 return
             if not self.values["output_dir"]:
-                # 默认：输出根 = 输入目录。跑起来后会在这下面自动建 <店铺名>/
-                # 每个 xlsx 的每个 sheet 会成为一层子文件夹。
                 self.values["output_dir"] = str(sd)
             od = Path(self.values["output_dir"])
             try:
@@ -255,6 +288,23 @@ class Wizard:
             except OSError as e:
                 messagebox.showerror("无法创建输出目录", str(e))
                 return
+            if not self.values["backup_dir"]:
+                self.values["backup_dir"] = _default_backup_dir(self.values["submitted_dir"])
+            bd = Path(self.values["backup_dir"])
+            try:
+                bd.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                messagebox.showerror("无法创建备份目录", str(e))
+                return
+            m = _validate_markup(self.values["ebay_markup"])
+            if m is None:
+                messagebox.showerror(
+                    "定价系数无效",
+                    f"「{self.values['ebay_markup']}」不是有效数字。请填一个正数，"
+                    f"常用 1.2 / 1.5 / 2.0。")
+                return
+            # Normalise ("1.20" → "1.2", "1.5000" → "1.5") for cleaner config.env
+            self.values["ebay_markup"] = f"{m:g}"
             self._next()
 
         self._nav(on_next=on_next)
@@ -292,8 +342,9 @@ class Wizard:
         env_values = {
             "SHEIN_SUBMITTED_DIR": self.values["submitted_dir"],
             "SHEIN_OUTPUT_DIR": self.values["output_dir"],
+            "SHEIN_BACKUP_DIR": self.values["backup_dir"],
             "SHEIN_INPUT_FILENAME": self.values["input_filename"],
-            "SHEIN_OUTPUT_FILENAME": self.values["output_filename"],
+            "SHEIN_EBAY_MARKUP": self.values["ebay_markup"],
         }
         if self.values["api_key"]:
             env_values["ANTHROPIC_API_KEY"] = self.values["api_key"]

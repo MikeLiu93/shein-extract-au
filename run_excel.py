@@ -1,42 +1,31 @@
 """
-Excel-based pipeline (澳洲站): read pending URLs from the MASTER (input) .xlsx,
-scrape them, and APPEND results as new rows to the ENRICHED (output) .xlsx —
-one row per (product × run). Master is otherwise read-only; the ONE write
-the script does is flipping **Done** rows' F='Y' → 'N' after each sheet
-(acknowledgement). Failed and Delisted rows keep F='Y' so a subsequent run
-retries them automatically. Enriched grows history; a re-processed seq
-appears as multiple rows dated differently.
-See docs/superpowers/specs/2026-08-04-master-enriched-split-design.md.
+Excel-based pipeline (澳洲站): read pending URLs from a single input .xlsx and
+write scrape results back to the SAME workbook (F-M columns) in place. Before
+any modification we back up the workbook to <BACKUP_DIR>/<name>-<ts>.xlsx so a
+bad run can never destroy days of accumulated data.
+
+Trigger (matches 美国站):
+    A row is pending iff B (链接) is non-empty AND F (日期) + G (状态) are both
+    empty. Done / Failed / Delisted rows are inert until the operator clears
+    F+G manually — Failed rows do NOT auto-retry on the next run.
 
 Usage:
-    python run_excel.py                              # SUBMITTED_DIR/SHEIN_INPUT_FILENAME
-                                                     # + SUBMITTED_DIR/SHEIN_OUTPUT_FILENAME
-    python run_excel.py "path/to/master.xlsx"        # explicit master
-    python run_excel.py <master> --enriched <path>   # explicit both
+    python run_excel.py                          # SUBMITTED_DIR/SHEIN_INPUT_FILENAME
+    python run_excel.py "path/to/input.xlsx"     # explicit path
 
-MASTER (input) schema — 6 cols, user-owned, scripts never write:
-    A: 编号        — sequence number (= output folder name). READ.
-    B: 链接        — Shein product URL. READ.
-    C: 原价        — manual sale price (AUD). READ. Blank → use scraped price.
-    D: 运费        — manual shipping (AUD). READ. Blank → use scraped shipping.
-    E: 变体        — variant filter declaration. READ. Blank → scrape all.
-    F: 是否要跑     — 'Y' (any case, whitespace tolerant) triggers this row.
+Schema (13 cols, matches 美国站):
+    A: 编号     B: 链接     C: 原价     D: 运费     E: 变体
+    F: 日期     G: 状态     H: 图片     I: 希音价格  J: 希音标题
+    K: eBay标题  L: eBay价格  M: 库存
 
-ENRICHED (output) schema — 21 cols, script-owned, appended per (product × run):
-    A-E: master snapshot (copied at scrape time)
-    F: 日期, G: 状态, H: 图片, I: 希音价格, J: 希音标题
-    K: eBay标题, L: eBay价格, M: 库存
-    N: eBay搜索日期, O: eBay同类低价, P: 低价链接
-    Q: eBay同类高价, R: 高价链接                   (filled by ebay_price_check.py)
-    S: Shein重跑日期, T: 更新价格, U: 更新库存    (reserved for future)
-
-Only master rows with F='Y' are processed. Non-master sheets (missing '链接'
-in B1) are silently skipped.
+C (原价) and D (运费), if filled, override scraped values.
+Only sheets with B1='链接' are processed.
 """
 
 import argparse
 import logging
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -47,51 +36,52 @@ from openpyxl import load_workbook
 
 from shein_scraper import (scrape_shein, RateLimitError, _add_picture_to_cell,
                            save_workbook_atomic)
-from config import SUBMITTED_DIR, OUTPUT_ROOT_2ND as OUTPUT_ROOT, INPUT_FILENAME
+from config import (SUBMITTED_DIR, OUTPUT_ROOT_2ND as OUTPUT_ROOT,
+                    INPUT_FILENAME, BACKUP_DIR)
 
 logger = logging.getLogger("run_excel")
 DEBUG_LOG_DIR = Path(__file__).resolve().parent / "debug_logs"
 
-# ── New Chinese-header template schema ────────────────────────────────────────
-# Cols A–M. See docs/superpowers/specs/2026-08-01-au-template-refactor-design.md §1.
-# 2026-08-02: column H "图片" added (embedded product image); prices+titles shifted +1.
+# ── Schema: A–M (13 cols) ─────────────────────────────────────────────────────
 COL_SEQ, COL_URL, COL_PRICE, COL_SHIPPING, COL_VARIANT_FILTER = 1, 2, 3, 4, 5
 COL_DATE, COL_STATUS, COL_PICTURE = 6, 7, 8
 COL_WEB_PRICE, COL_SHEIN_TITLE = 9, 10
 COL_EBAY_TITLE, COL_EBAY_PRICE, COL_STOCK = 11, 12, 13
 
-# Enriched sheet columns A~U. See spec 2026-08-04-master-enriched-split-design.md §2.
+# Chinese headers matching 美国站.
 EXPECTED_HEADERS = ["编号", "链接", "原价", "运费", "变体",
                     "日期", "状态", "图片", "希音价格", "希音标题",
-                    "eBay标题", "eBay价格", "库存",
-                    "eBay搜索日期", "eBay同类低价", "低价链接",
-                    "eBay同类高价", "高价链接",
-                    "Shein重跑日期", "更新价格", "更新库存"]
+                    "eBay标题", "eBay价格", "库存"]
 
-# ── Master (输入) schema ─────────────────────────────────────────────────────
-# 主表只有 6 列，脚本只读。See spec 2026-08-04-master-enriched-split-design.md §1.
-MASTER_COL_TRIGGER = 6  # F 是否要跑 (Y/空/其他)
-
-MASTER_EXPECTED_HEADERS = ["编号", "链接", "原价", "运费", "变体", "是否要跑"]
+# 备份保留最近多少份；旧的自动删。SHEIN_BACKUP_KEEP env var 可覆盖。
+BACKUP_KEEP = int(os.environ.get("SHEIN_BACKUP_KEEP", "20"))
 
 
-def _read_master_pending_rows(ws) -> list[dict]:
-    """Return list of dicts for rows in the master where F (是否要跑) normalizes
-    to 'Y' (case-insensitive, whitespace-stripped). Non-master sheets return [].
-    Shape: {row, seq, url, price, shipping, variant_filter}. Rows with invalid
-    seq or missing URL are logged and skipped."""
+def _sheet_matches_template(ws) -> bool:
+    """The sheet must have '链接' in col B row 1 to be treated as our schema."""
+    return str(ws.cell(1, COL_URL).value or "").strip() == "链接"
+
+
+def _read_pending_rows(ws) -> list[dict]:
+    """A row is pending iff B (链接) is non-empty AND F (日期) + G (状态) are
+    both empty. Returns list of dicts with row/seq/url/price/shipping/variant_filter.
+
+    Rows with non-numeric 编号 / 原价 / 运费 are logged and skipped rather than
+    aborting the whole run.
+    """
     if not _sheet_matches_template(ws):
         return []
     pending = []
     for r in range(2, ws.max_row + 1):
-        seq = ws.cell(r, COL_SEQ).value
         url = ws.cell(r, COL_URL).value
-        trigger = str(ws.cell(r, MASTER_COL_TRIGGER).value or "").strip().upper()
-        if trigger != "Y":
+        if url in (None, ""):
             continue
-        if not url:
-            logger.info("  row %d: skip (F=Y but 链接 empty)", r)
+        date = ws.cell(r, COL_DATE).value
+        status = ws.cell(r, COL_STATUS).value
+        if (date not in (None, "")) or (status not in (None, "")):
             continue
+
+        seq = ws.cell(r, COL_SEQ).value
         try:
             seq_int = int(seq) if seq is not None else None
         except (TypeError, ValueError):
@@ -100,6 +90,7 @@ def _read_master_pending_rows(ws) -> list[dict]:
         if seq_int is None:
             logger.info("  row %d: skip (编号 empty)", r)
             continue
+
         raw_price = ws.cell(r, COL_PRICE).value
         raw_ship = ws.cell(r, COL_SHIPPING).value
         try:
@@ -112,177 +103,14 @@ def _read_master_pending_rows(ws) -> list[dict]:
         except (TypeError, ValueError):
             logger.info("  row %d: skip (运费 '%s' not numeric)", r, raw_ship)
             continue
+
         variant_filter = str(ws.cell(r, COL_VARIANT_FILTER).value or "").strip()
         pending.append({
-            "row": r,
-            "seq": seq_int,
-            "url": str(url).strip(),
-            "price": price,
-            "shipping": shipping,
+            "row": r, "seq": seq_int, "url": str(url).strip(),
+            "price": price, "shipping": shipping,
             "variant_filter": variant_filter,
         })
     return pending
-
-
-def _ensure_enriched_sheet(enriched_path, sheet_name: str):
-    """Load or create the enriched workbook, then load or create the store
-    sheet with the 21-col header row. Returns (wb, ws).
-
-    Row 1 is script-owned: if any cell in row 1 disagrees with the canonical
-    EXPECTED_HEADERS, that cell is silently rewritten (self-heal). This
-    makes the script robust to typos, extra whitespace, missing headers, or
-    old partial-header files — the user only needs to know 'row 1 = headers'
-    without memorising 21 exact strings. Data rows (2+) are never touched
-    here (append happens elsewhere)."""
-    from pathlib import Path
-    from openpyxl import Workbook, load_workbook
-
-    p = Path(enriched_path)
-    if p.exists():
-        wb = load_workbook(p)
-    else:
-        wb = Workbook()
-        # openpyxl seeds a default 'Sheet' we don't want in the final layout.
-        default_name = wb.sheetnames[0]
-        if default_name != sheet_name:
-            del wb[default_name]
-
-    if sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        # Self-heal row 1: overwrite any cell that doesn't match the canonical
-        # header. Data rows below are preserved intact.
-        healed = []
-        for ci, expected in enumerate(EXPECTED_HEADERS, 1):
-            actual = ws.cell(1, ci).value
-            if actual != expected:
-                ws.cell(1, ci).value = expected
-                healed.append((ci, actual, expected))
-        if healed:
-            logger.warning(
-                "  [self-heal] Enriched sheet '%s' row 1 was rewritten in %d cell(s). "
-                "Sample: col %d %r → %r",
-                sheet_name, len(healed), healed[0][0], healed[0][1], healed[0][2],
-            )
-        # Compact: pull real data rows up so they sit right below the header.
-        # Fixes the 'output empty' UX where phantom empty rows (Excel format
-        # artifact) buried the data at row 1000+.
-        removed = _compact_data_rows(ws, key_col=1)
-        if removed:
-            logger.info(
-                "  [compact] Enriched sheet '%s': removed %d empty rows; "
-                "data now starts at row 2.",
-                sheet_name, removed,
-            )
-    else:
-        ws = wb.create_sheet(sheet_name)
-        for ci, header in enumerate(EXPECTED_HEADERS, 1):
-            ws.cell(1, ci).value = header
-
-    return wb, ws
-
-
-def _compact_data_rows(ws, key_col: int = 1) -> int:
-    """Remove every row between the header (row 1) and the last data row
-    where `key_col` (col A / 编号 by default) is empty. Modifies ws in
-    place. Returns number of rows deleted.
-
-    Why: user's fresh xlsx often has phantom empty rows extending far
-    past the header (Excel formatting artifact). Historical data ends
-    up appended after those phantom rows, buried at row 1000+. Compacting
-    on every open guarantees data stays glued to the header — operator
-    sees the whole picture without scrolling.
-
-    Header row 1 is preserved. Rows past the last data row (trailing
-    phantom formatting) are ALSO removed so `ws.max_row` doesn't drift
-    upward over time.
-    """
-    # Find the highest row with real data in key_col.
-    last_data = 1
-    for r in range(ws.max_row, 1, -1):
-        if ws.cell(r, key_col).value is not None:
-            last_data = r
-            break
-
-    removed = 0
-    # 1) Remove trailing empty rows past last data (rows [last_data+1 .. max_row]).
-    trailing_start = last_data + 1
-    if ws.max_row >= trailing_start:
-        n = ws.max_row - trailing_start + 1
-        ws.delete_rows(trailing_start, n)
-        removed += n
-
-    # 2) Remove empty rows between header and last data — bottom-up so
-    #    indices stay valid as we delete.
-    #    (After step 1, ws.max_row == last_data; but delete_rows may not
-    #    always update max_row atomically, so re-scan the range.)
-    for r in range(last_data, 1, -1):
-        if ws.cell(r, key_col).value is None:
-            ws.delete_rows(r, 1)
-            removed += 1
-
-    return removed
-
-
-def _next_data_row(ws, key_col: int = 1) -> int:
-    """Return the row index to append the next data row to: 1 + the highest
-    row with a non-None value in `key_col` (default col A = 编号). If no
-    data rows yet, returns 2 (right after the header row).
-
-    Assumes _compact_data_rows has already been called (no gaps between
-    header and last data row). Falls back safely if there are gaps by
-    scanning backward for the first non-empty key_col value.
-    """
-    for r in range(ws.max_row, 1, -1):
-        if ws.cell(r, key_col).value is not None:
-            return r + 1
-    return 2
-
-
-def _append_enriched_row(ws, master_row: dict, result: dict,
-                          picture_path=None) -> int:
-    """Append one row to the enriched sheet at the next real data row
-    (via _next_data_row — ignores trailing/leading phantom formatting rows).
-
-    - master_row must have: seq, url, price, shipping, variant_filter
-      (copied verbatim to A-E — a snapshot of the master row's values at
-      scrape time).
-    - result may have: date, status, web_price, shein_title, ebay_title,
-      ebay_price, stock. Unspecified keys skip that cell.
-    - picture_path (optional) — file path to embed in H; row height auto-grown.
-
-    Returns the row index that was written."""
-    row = _next_data_row(ws, key_col=COL_SEQ)
-
-    # A-E: master snapshot.
-    ws.cell(row, COL_SEQ).value = master_row.get("seq")
-    ws.cell(row, COL_URL).value = master_row.get("url")
-    if master_row.get("price") is not None:
-        ws.cell(row, COL_PRICE).value = master_row["price"]
-    if master_row.get("shipping") is not None:
-        ws.cell(row, COL_SHIPPING).value = master_row["shipping"]
-    if master_row.get("variant_filter"):
-        ws.cell(row, COL_VARIANT_FILTER).value = master_row["variant_filter"]
-
-    # F-M: scrape result (via existing writer, which already handles
-    # None-means-skip semantics and image embedding).
-    _write_result_row(
-        ws, row=row,
-        date=result.get("date", ""),
-        status=result.get("status", ""),
-        picture_path=picture_path,
-        web_price=result.get("web_price"),
-        shein_title=result.get("shein_title"),
-        ebay_title=result.get("ebay_title"),
-        ebay_price=result.get("ebay_price"),
-        stock=result.get("stock"),
-    )
-    return row
-
-
-def _sheet_matches_template(ws) -> bool:
-    """The sheet must have '链接' in col B row 1 to be treated as the new schema."""
-    return str(ws.cell(1, COL_URL).value or "").strip() == "链接"
-
 
 
 def _write_result_row(
@@ -316,6 +144,63 @@ def _write_result_row(
         ws.cell(row, COL_STOCK).value = stock
 
 
+# ── Backup + legacy migration ─────────────────────────────────────────────────
+
+def _backup_workbook(input_path: Path, backup_dir: Path) -> Path:
+    """Copy input_path into backup_dir with a timestamp suffix; return the copy path.
+    Runs before any in-place modification so a botched save can be reversed."""
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    dst = backup_dir / f"{input_path.stem}-{ts}{input_path.suffix}"
+    shutil.copy2(input_path, dst)
+    return dst
+
+
+def _prune_backups(backup_dir: Path, stem: str, keep: int) -> int:
+    """Keep the newest `keep` backups matching stem-*.xlsx; delete the rest.
+    Returns number of files deleted. Legacy-* backups (from the one-shot
+    migration) are excluded — those stay forever until the operator clears
+    them by hand."""
+    if not backup_dir.is_dir() or keep is None or keep <= 0:
+        return 0
+    all_bk = sorted(
+        (p for p in backup_dir.glob(f"{stem}-*.xlsx")
+         if "-legacy-" not in p.name),
+        key=lambda p: p.stat().st_mtime, reverse=True,
+    )
+    removed = 0
+    for old in all_bk[keep:]:
+        try:
+            old.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _archive_legacy_enriched(old_path: Path, backup_dir: Path) -> Path:
+    """Move the old 富表 (enriched output) file into backup_dir with a
+    -legacy-<date>.xlsx suffix. Runs once, on the first launch after
+    upgrading from the master/enriched-split architecture. Suffix collisions
+    (multiple upgrades same day) get -1, -2, ... appended."""
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d")
+    base = backup_dir / f"{old_path.stem}-legacy-{ts}{old_path.suffix}"
+    dst = base
+    counter = 1
+    while dst.exists():
+        counter += 1
+        dst = backup_dir / f"{old_path.stem}-legacy-{ts}-{counter}{old_path.suffix}"
+    shutil.move(str(old_path), str(dst))
+    logger.warning(
+        "  [升级迁移] 检测到旧富表 %s；已挪到 %s。新架构下输入表本身就是输出表。",
+        old_path.name, dst,
+    )
+    return dst
+
+
+# ── Logging / save ────────────────────────────────────────────────────────────
+
 def setup_logging():
     DEBUG_LOG_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -341,44 +226,47 @@ def setup_logging():
 
 
 def safe_save(wb, xlsx_path: Path) -> None:
-    """原子保存。被别人锁住（Excel 开着）时退回 '2' 后缀的副本。
-
-    走 save_workbook_atomic：先写同目录的临时文件、自检完整性，再原子替换。
-    保存中途失败时目标文件一个字节都不会变 —— 以前是直接 wb.save(目标)，
-    写到一半炸掉就会留下没有 [Content_Types].xml 的半截文件。
-    """
+    """原子保存。被别人锁住（Excel 开着）时退回 '2' 后缀的副本。"""
     try:
         save_workbook_atomic(wb, xlsx_path)
     except PermissionError:
         alt = xlsx_path.with_stem(xlsx_path.stem + "2")
-        logger.warning("Cannot save to %s (locked), saving to %s", xlsx_path.name, alt.name)
+        logger.warning("Cannot save to %s (locked), saving to %s",
+                       xlsx_path.name, alt.name)
         save_workbook_atomic(wb, alt)
         logger.info("Saved to alternate: %s", alt.name)
 
 
-def process_excel(master_path: Path, enriched_path: Path) -> None:
-    """Read the master (input) workbook, scrape every row where F='Y', and
-    append one row per (product × run) to the enriched (output) workbook.
-    The master is opened read-only; only the enriched is saved. See spec
-    2026-08-04-master-enriched-split-design.md."""
-    logger.info("Master:   %s", master_path.name)
-    logger.info("Enriched: %s", enriched_path.name)
+# ── Main pipeline ─────────────────────────────────────────────────────────────
 
-    if not master_path.exists():
-        logger.error("Master file not found: %s", master_path)
+def process_excel(input_path: Path) -> None:
+    """Read pending rows from the input xlsx, scrape, write F–M back in place.
+    Backup runs before the first write so a bad save can be reversed."""
+    logger.info("Input:   %s", input_path.name)
+
+    if not input_path.exists():
+        logger.error("Input file not found: %s", input_path)
         return
 
-    master_wb = load_workbook(master_path, read_only=False)  # read-only intent — no save() called
+    backup_path = _backup_workbook(input_path, BACKUP_DIR)
+    logger.info("Backup:  %s", backup_path)
+    removed = _prune_backups(BACKUP_DIR, input_path.stem, keep=BACKUP_KEEP)
+    if removed:
+        logger.info("  [备份] Pruned %d old backup(s), keeping newest %d",
+                    removed, BACKUP_KEEP)
 
-    for ws_name in master_wb.sheetnames:
-        master_ws = master_wb[ws_name]
+    wb = load_workbook(input_path)
+    modified = False
+
+    for ws_name in wb.sheetnames:
+        ws = wb[ws_name]
         store = ws_name.strip()
-        pending = _read_master_pending_rows(master_ws)
+        pending = _read_pending_rows(ws)
         if not pending:
-            logger.info("  Sheet '%s': no F=Y rows (or not master schema)", store)
+            logger.info("  Sheet '%s': no pending rows (or not scrape schema)", store)
             continue
 
-        logger.info("  Sheet '%s': %d row(s) with F=Y: seq %s",
+        logger.info("  Sheet '%s': %d pending row(s): seq %s",
                     store, len(pending), [p["seq"] for p in pending])
 
         store_dir = OUTPUT_ROOT / store
@@ -426,15 +314,10 @@ def process_excel(master_path: Path, enriched_path: Path) -> None:
         finally:
             os.chdir(old_cwd)
 
-        # Open (or create) enriched sheet — one save per sheet at the end.
-        # (_ensure_enriched_sheet self-heals row 1 headers; no ValueError path.)
-        enriched_wb, enriched_ws = _ensure_enriched_sheet(enriched_path, store)
-
-        # Append one row per pending master row. Track which ones ended
-        # up 'Done' so we can flip only their F trigger to 'N' below.
-        done_rows = []
+        # Write results back to input xlsx in-place, one row per pending.
         for p in pending:
             seq = p["seq"]
+            row = p["row"]
             seq_folder = store_dir / str(seq)
             has_files = seq_folder.is_dir() and any(seq_folder.iterdir())
 
@@ -447,87 +330,85 @@ def process_excel(master_path: Path, enriched_path: Path) -> None:
                                 or "[goods_name]" in (rec.get("title") or "")))
 
             if has_files and not is_bad_data and rec:
-                result_dict = {
-                    "date": today,
-                    "status": "Done",
-                    "web_price": rec.get("web_price_display"),
-                    "shein_title": rec.get("original_title") or rec.get("title"),
-                    "ebay_title": rec.get("ebay_title"),
-                    "ebay_price": rec.get("ebay_price"),
-                    "stock": rec.get("stock_summary"),
-                }
                 picture = rec.get("first_image_path") or None
-                _append_enriched_row(enriched_ws, p, result_dict, picture_path=picture)
-                done_rows.append(p)
-                logger.info("    seq %d → Done (appended row %d)", seq, enriched_ws.max_row)
+                _write_result_row(
+                    ws, row=row,
+                    date=today, status="Done",
+                    picture_path=picture,
+                    web_price=rec.get("web_price_display"),
+                    shein_title=rec.get("original_title") or rec.get("title"),
+                    ebay_title=rec.get("ebay_title"),
+                    ebay_price=rec.get("ebay_price"),
+                    stock=rec.get("stock_summary"),
+                )
+                logger.info("    seq %d row %d → Done", seq, row)
             elif rec and rec.get("status") == "DELISTED":
-                _append_enriched_row(enriched_ws, p,
-                                     {"date": today, "status": "Delisted"})
-                logger.info("    seq %d → Delisted (F stays Y — clear manually if not retrying)", seq)
+                _write_result_row(ws, row=row, date=today, status="Delisted")
+                logger.info("    seq %d row %d → Delisted "
+                            "(clear F+G to retry)", seq, row)
             else:
                 detail = rec.get("status", "") if rec else ""
                 if is_bad_data:
                     detail = "no data loaded"
-                _append_enriched_row(enriched_ws, p,
-                                     {"date": today, "status": "Failed"})
-                logger.info("    seq %d → Failed %s (F stays Y for retry)", seq,
+                _write_result_row(ws, row=row, date=today, status="Failed")
+                logger.info("    seq %d row %d → Failed %s "
+                            "(clear F+G to retry)", seq, row,
                             f"({detail})" if detail else "")
+            modified = True
 
-        safe_save(enriched_wb, enriched_path)
-        logger.info("  Saved enriched progress to %s (sheet %r)",
-                    enriched_path.name, store)
+    if modified:
+        safe_save(wb, input_path)
+        logger.info("Saved results to %s", input_path.name)
+    else:
+        logger.info("No pending rows anywhere; input untouched.")
 
-        # Flip master's F=Y → F=N ONLY for rows that ended up Done. Failed
-        # and Delisted rows keep F=Y so a subsequent run retries them
-        # automatically. This is the ONLY write the script does to the
-        # master (only F column, only Y→N direction).
-        if done_rows:
-            for p in done_rows:
-                master_ws.cell(p["row"], MASTER_COL_TRIGGER).value = "N"
-            safe_save(master_wb, master_path)
-            logger.info("  Flipped %d Done rows F=Y → N in master (sheet %r); "
-                        "%d Failed/Delisted kept Y for retry",
-                        len(done_rows), store, len(pending) - len(done_rows))
-        else:
-            logger.info("  No Done rows this sheet; master F unchanged "
-                        "(%d Failed/Delisted keep Y)", len(pending))
 
-    master_wb.close()
-    logger.info("Done.")
+def _one_shot_legacy_migration(input_path: Path) -> None:
+    """If an old 富表 (from the pre-single-workbook architecture) is still
+    sitting in SUBMITTED_DIR, move it to the backup folder so employees don't
+    stare at two parallel workbooks. Detects the old file via the SHEIN_OUTPUT_FILENAME
+    env var (still present in employees' legacy config.env from 0.3.6 and earlier)."""
+    old_name = os.environ.get("SHEIN_OUTPUT_FILENAME", "").strip()
+    if not old_name:
+        return
+    old_p = SUBMITTED_DIR / old_name
+    if not old_p.exists():
+        return
+    try:
+        # Don't move the input xlsx if the user reused the same filename.
+        if old_p.resolve() == input_path.resolve():
+            return
+    except OSError:
+        return
+    try:
+        _archive_legacy_enriched(old_p, BACKUP_DIR)
+    except OSError as e:
+        logger.warning("  [升级迁移] 无法搬走旧富表 %s: %s", old_p, e)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Master → Enriched Shein scrape pipeline (澳洲站)")
-    parser.add_argument("master_file", nargs="?", default=None,
-                        help="Master (input) .xlsx path. Default: "
+        description="Single-workbook Shein scrape pipeline (澳洲站)")
+    parser.add_argument("input_file", nargs="?", default=None,
+                        help="Input .xlsx path. Default: "
                              "SUBMITTED_DIR/SHEIN_INPUT_FILENAME.")
-    parser.add_argument("--enriched", default=None,
-                        help="Enriched (output) .xlsx path. Default: "
-                             "SUBMITTED_DIR/SHEIN_OUTPUT_FILENAME.")
     args = parser.parse_args()
 
     setup_logging()
 
-    from config import require_output_filename
-    output_name = require_output_filename()
-
-    if args.master_file:
-        master_path = Path(args.master_file)
+    if args.input_file:
+        input_path = Path(args.input_file)
     elif INPUT_FILENAME:
-        master_path = SUBMITTED_DIR / INPUT_FILENAME
+        input_path = SUBMITTED_DIR / INPUT_FILENAME
     else:
-        logger.error("No master file given and SHEIN_INPUT_FILENAME not set in .env")
+        logger.error("No input file given and SHEIN_INPUT_FILENAME not set in config.")
         return
 
-    if args.enriched:
-        enriched_path = Path(args.enriched)
-    else:
-        enriched_path = SUBMITTED_DIR / output_name
+    _one_shot_legacy_migration(input_path)
 
     logger.info("=" * 60)
     try:
-        process_excel(master_path, enriched_path)
+        process_excel(input_path)
     except Exception as e:
         logger.exception("Fatal error: %s", e)
     logger.info("All done.")
