@@ -63,8 +63,14 @@ _backup_env = os.environ.get("SHEIN_BACKUP_DIR", "").strip()
 BACKUP_DIR = Path(_backup_env) if _backup_env else SUBMITTED_DIR / "_backups"
 
 # ── eBay 定价 & 运费 ─────────────────────────────────────────────────────────
-# eBay 价格公式：Price × EBAY_MARKUP + Shipping。系数默认 1.2，员工在向导里改。
-EBAY_MARKUP = float(os.environ.get("SHEIN_EBAY_MARKUP", "1.2"))
+# eBay 价格分档公式：
+#   price <  LOW_PRICE_THRESHOLD  →  price + LOW_PRICE_FLAT_MARKUP + shipping
+#   price >= LOW_PRICE_THRESHOLD  →  price × EBAY_MARKUP           + shipping
+# 低价档用固定加价（$10）而不是乘系数——$5 商品乘 1.2 只赚 $1，覆盖不了 eBay
+# 上架费。高价档用系数（员工在向导里选 1.2/1.5/2.0）。$20 是阈值，员工不改。
+EBAY_MARKUP            = float(os.environ.get("SHEIN_EBAY_MARKUP", "1.2"))
+LOW_PRICE_THRESHOLD    = float(os.environ.get("SHEIN_AU_LOW_PRICE_THRESHOLD", "20.0"))
+LOW_PRICE_FLAT_MARKUP  = float(os.environ.get("SHEIN_AU_LOW_PRICE_MARKUP", "10.0"))
 
 # 澳洲站 Standard shipping：价格 ≥ FREE_SHIPPING_THRESHOLD 免运，否则收
 # DEFAULT_SHIPPING_FEE。表格 D 列的手动运费在 run_excel.py 一层做覆盖。

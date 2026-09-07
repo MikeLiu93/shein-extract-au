@@ -69,7 +69,8 @@ from openpyxl.utils.cell import coordinate_to_tuple
 # 运费 & 定价系数都从 config 拿，那边负责先把 config.env 载进 os.environ。
 # 直接在这里 os.environ.get() 会在 config._load_env_file() 之前触发，读不到员工
 # 在向导里改过的值 —— 得让 config 做门面。
-from config import EBAY_MARKUP, DEFAULT_SHIPPING_FEE, FREE_SHIPPING_THRESHOLD
+from config import (EBAY_MARKUP, DEFAULT_SHIPPING_FEE, FREE_SHIPPING_THRESHOLD,
+                    LOW_PRICE_THRESHOLD, LOW_PRICE_FLAT_MARKUP)
 CDP_PORT               = 9223
 PAGE_LOAD_MIN_WAIT     = 3        # 最少等待秒数（让 JS 初始化）
 PAGE_LOAD_MAX_WAIT     = 20       # 最多等待秒数（轮询 goods_sn）
@@ -1290,7 +1291,16 @@ def _calc_shipping(price) -> float:
 
 
 def _ebay_listing_price(price: float, shipping: float) -> float:
-    return round(float(price or 0) * EBAY_MARKUP + float(shipping or 0), 2)
+    """分档定价（2026-09 引入）：
+        price <  LOW_PRICE_THRESHOLD (20)  → price + LOW_PRICE_FLAT_MARKUP (10) + shipping
+        price >= LOW_PRICE_THRESHOLD       → price × EBAY_MARKUP               + shipping
+    在阈值 $20 处曲线不连续（$19 → +$10 加价；$20 → 只加 20%）——业主已知。
+    """
+    p = float(price or 0)
+    s = float(shipping or 0)
+    if p < LOW_PRICE_THRESHOLD:
+        return round(p + LOW_PRICE_FLAT_MARKUP + s, 2)
+    return round(p * EBAY_MARKUP + s, 2)
 
 
 def _merge_main_sale_attr_colors(variations: dict, main_sale_attrs: list) -> dict:
