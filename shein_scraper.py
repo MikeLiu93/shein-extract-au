@@ -1303,16 +1303,60 @@ def _ebay_listing_price(price: float, shipping: float) -> float:
     return round(p * EBAY_MARKUP + s, 2)
 
 
-def _merge_main_sale_attr_colors(variations: dict, main_sale_attrs: list) -> dict:
-    """mainSaleAttribute 是颜色变体的权威清单（每个颜色 = 独立 goods_sn）。
+_URL_GOODS_ID_RE = re.compile(r"-p-(\d+)\.html", re.I)
 
-    DOM 抓取在 URL 预选了某颜色时（?main_attr=...）只会拿到选中的那一个，
-    导致其它颜色丢失。用 main_sale_attrs 的完整颜色列表覆盖 variations 中
-    对应属性（按 attr_name 大小写不敏感匹配，保留原 key 的写法）。
+
+def _pick_current_color_from_main_sale_attrs(
+    url: "str | None", main_sale_attrs: list,
+) -> "dict | None":
+    """URL 里的 `-p-<数字>.html` 那个 goods_id 一定能在 mainSaleAttribute.info
+    里找到对应的那一条—— 那条的 attr_value_name 就是这个 URL 的**权威颜色**。
+    这比 SHEIN 自己的 `isMainGood` 靠谱（实测 SHEIN 经常不填这个字段）。
+
+    返回 {"attr_name": ..., "value": ...} 或 None（URL 没匹到、或数据缺失）。
+    """
+    if not url or not main_sale_attrs:
+        return None
+    m = _URL_GOODS_ID_RE.search(url)
+    if not m:
+        return None
+    urlgid = m.group(1)
+    for msa in main_sale_attrs:
+        if str(msa.get("goods_id") or "").strip() != urlgid:
+            continue
+        attr = (msa.get("attr_name") or "").strip()
+        val = (msa.get("attr_value_name") or "").strip()
+        if attr and val:
+            return {"attr_name": attr, "value": val}
+    return None
+
+
+def _merge_main_sale_attr_colors(
+    variations: dict, main_sale_attrs: list, url: "str | None" = None,
+) -> dict:
+    """把 mainSaleAttribute 里 URL 对应的那一色写回 variations——脚本因此知道
+    "这个 URL 具体是哪一色"，不再需要员工在 E 列里拼对内部颜色名。
+
+    - 有 URL 且能定位到当前色 → variations[Color] = [<那一色>]（单值）
+    - 没 URL 或 URL 没匹上 → 退回旧行为：塞全部 SPU 颜色（保证 DOM 抓漏
+      颜色的 p-454706293 那种老坑不复发）
+
+    (attr_name 大小写不敏感匹配，保留 variations 里原来的 key 大小写。)
     """
     if not main_sale_attrs:
         return variations
     variations = dict(variations or {})
+
+    current = _pick_current_color_from_main_sale_attrs(url, main_sale_attrs)
+    if current:
+        existing = next(
+            (k for k in variations if k.lower() == current["attr_name"].lower()),
+            None,
+        )
+        variations[existing or current["attr_name"]] = [current["value"]]
+        return variations
+
+    # Fallback: no URL / no match → collect the full SPU color list (老行为)
     attr_name = ""
     vals, seen = [], set()
     for msa in main_sale_attrs:
@@ -2917,7 +2961,8 @@ def _scrape_one_url(
             raise ValueError("JS returned unexpected type — page may not have loaded")
 
         data["variations"] = _merge_main_sale_attr_colors(
-            data.get("variations") or {}, data.get("main_sale_attrs") or []
+            data.get("variations") or {}, data.get("main_sale_attrs") or [],
+            url=url,
         )
 
         if variant_filter_decl:
@@ -2928,7 +2973,20 @@ def _scrape_one_url(
             if _unknown:
                 print(f"  [变体过滤] 声明中未匹配到: {_unknown}")
             if not _kept and (data.get("sku_prices") or []):
-                rec["status"] = f"ERROR: variant_filter_no_match ({variant_filter_decl!r})"
+                current = _pick_current_color_from_main_sale_attrs(
+                    url, data.get("main_sale_attrs") or []
+                )
+                hint = ""
+                if current:
+                    hint = (
+                        f"；此 URL 的实际 {current['attr_name']} 是 "
+                        f"{current['value']!r}（SHEIN 内部命名，可能跟 URL 里的字面不一样）。"
+                        f"请把 E 列改成 “{current['attr_name']}:{current['value']}” "
+                        f"或清空 E 列跑所有变体"
+                    )
+                rec["status"] = (
+                    f"ERROR: variant_filter_no_match ({variant_filter_decl!r}){hint}"
+                )
                 return rec
             data["sku_prices"] = _kept
             if _filt_vars:
