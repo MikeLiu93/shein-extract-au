@@ -156,16 +156,40 @@ def _backup_workbook(input_path: Path, backup_dir: Path) -> Path:
     return dst
 
 
+RESULTS_SUFFIX = "-RESULTS"
+
+
 def _prune_backups(backup_dir: Path, stem: str, keep: int) -> int:
-    """Keep the newest `keep` backups matching stem-*.xlsx; delete the rest.
-    Returns number of files deleted. Legacy-* backups (from the one-shot
-    migration) are excluded — those stay forever until the operator clears
-    them by hand."""
+    """Keep the newest `keep` pre-run backups matching stem-<ts>.xlsx; delete
+    the rest. Legacy-* files (one-shot migration) AND *-RESULTS.xlsx files
+    (post-run result snapshots — pruned independently by
+    _prune_results_backups) are excluded. Returns number of files deleted."""
     if not backup_dir.is_dir() or keep is None or keep <= 0:
         return 0
     all_bk = sorted(
         (p for p in backup_dir.glob(f"{stem}-*.xlsx")
-         if "-legacy-" not in p.name),
+         if "-legacy-" not in p.name
+         and not p.stem.endswith(RESULTS_SUFFIX)),
+        key=lambda p: p.stat().st_mtime, reverse=True,
+    )
+    removed = 0
+    for old in all_bk[keep:]:
+        try:
+            old.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _prune_results_backups(backup_dir: Path, stem: str, keep: int) -> int:
+    """Keep the newest `keep` post-run RESULTS files matching
+    stem-<ts>-RESULTS.xlsx; delete the rest. Independent quota from
+    the pre-run backups."""
+    if not backup_dir.is_dir() or keep is None or keep <= 0:
+        return 0
+    all_bk = sorted(
+        backup_dir.glob(f"{stem}-*{RESULTS_SUFFIX}.xlsx"),
         key=lambda p: p.stat().st_mtime, reverse=True,
     )
     removed = 0
@@ -235,6 +259,40 @@ def safe_save(wb, xlsx_path: Path) -> None:
                        xlsx_path.name, alt.name)
         save_workbook_atomic(wb, alt)
         logger.info("Saved to alternate: %s", alt.name)
+
+
+def _persist_workbook_with_backup(wb, input_path: Path,
+                                   backup_dir: Path, keep: int) -> Path:
+    """Backup-first save (2026-09-10):
+
+    有员工机器上 wb.save() 完成后，openpyxl 写出来的临时文件被 Google Drive
+    客户端 / EDR 抢锁改写，第一步 zip 校验就炸 (BadZipFile)。原表写不进去
+    员工的抓取成果就全没了。所以 always 先往 _backups/ 存一份带结果的 xlsx
+    (那个路径通常没问题)，然后再尝试写回原表；原表失败时只打警告不 crash，
+    员工从备份夹拷回去就行。
+
+    Returns the RESULTS backup path. Raises if the backup save itself fails
+    (should not happen on a healthy backup dir; if it does, it's serious).
+    """
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    results_backup = (backup_dir
+                      / f"{input_path.stem}-{ts}{RESULTS_SUFFIX}{input_path.suffix}")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    save_workbook_atomic(wb, results_backup)
+    logger.info("结果已存到备份夹: %s", results_backup)
+    _prune_results_backups(backup_dir, input_path.stem, keep=keep)
+
+    try:
+        safe_save(wb, input_path)
+        logger.info("同时写回原表: %s", input_path.name)
+    except Exception as e:
+        logger.warning(
+            "[!] 写回原表 %s 失败: %s。\n"
+            "     结果已完整保存在备份夹: %s\n"
+            "     可以从备份夹拷回原路径覆盖原表，或直接用备份夹里这份接着工作。",
+            input_path.name, e, results_backup,
+        )
+    return results_backup
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -357,8 +415,7 @@ def process_excel(input_path: Path) -> None:
             modified = True
 
     if modified:
-        safe_save(wb, input_path)
-        logger.info("Saved results to %s", input_path.name)
+        _persist_workbook_with_backup(wb, input_path, BACKUP_DIR, BACKUP_KEEP)
     else:
         logger.info("No pending rows anywhere; input untouched.")
 
