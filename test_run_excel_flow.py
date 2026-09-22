@@ -269,6 +269,58 @@ def test_prune_results_ignores_non_results_files():
 
 # ── _persist_workbook_with_backup: 员工机器上原表写不进也不能丢数据 ─────────
 
+def _wb_with_embedded_image():
+    """Build a workbook shaped like a real scrape result: an embedded JPEG in H2.
+    The double-save bug (fixed 2026-09-23) only manifests with embedded images —
+    openpyxl consumes the image BytesIO on first save, so a second wb.save()
+    writes a torn xlsx. Plain-text workbooks slip past unnoticed."""
+    from io import BytesIO
+    from openpyxl.drawing.image import Image as XLImage
+    from PIL import Image as PILImage
+    wb = Workbook()
+    ws = wb.active
+    ws["A1"] = "scraped"
+    buf = BytesIO()
+    PILImage.new("RGB", (200, 200), (30, 120, 200)).save(
+        buf, format="JPEG", quality=80)
+    buf.seek(0)
+    xl_img = XLImage(buf)
+    xl_img.width = 100
+    xl_img.height = 100
+    ws.add_image(xl_img, "H2")
+    return wb
+
+
+def test_persist_survives_workbook_with_embedded_image():
+    """Regression guard for 0.3.10 → 0.3.11: with an embedded image, the old
+    flow (save twice on same wb) wrote a corrupted second file. New flow saves
+    once + shutil.copy2 — both destinations must load cleanly."""
+    import zipfile
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        wb = _wb_with_embedded_image()
+        input_path = td / "input.xlsx"
+        # Pre-seed input so this is a real replace
+        Workbook().save(input_path)
+        backup_dir = td / "_backups"
+
+        results_backup = _persist_workbook_with_backup(
+            wb, input_path, backup_dir, keep=20
+        )
+
+        # Both files must be openable — the old code's second file failed here
+        # with KeyError: "[Content_Types].xml" not in archive.
+        for p in (results_backup, input_path):
+            with zipfile.ZipFile(p) as z:
+                assert "[Content_Types].xml" in z.namelist(), (
+                    f"{p.name} 缺少 [Content_Types].xml — 双 save 回归了")
+                assert z.testzip() is None, f"{p.name} zip 校验失败"
+            wb_loaded = load_workbook(p)
+            assert wb_loaded.active["A1"].value == "scraped"
+            # Image landed
+            assert len(wb_loaded.active._images) >= 1, f"{p.name} 图片没落"
+
+
 def test_persist_writes_results_backup_and_input_when_both_succeed():
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -291,8 +343,8 @@ def test_persist_writes_results_backup_and_input_when_both_succeed():
 
 
 def test_persist_survives_original_save_failure():
-    """The bug the employee hit: BadZipFile at safe_save time. RESULTS backup
-    must land AND function must return normally (no crash)."""
+    """The bug the employee hit: something goes wrong at input-file write time.
+    RESULTS backup must land AND function must return normally (no crash)."""
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         wb = Workbook(); wb.active["A1"] = "scraped"
@@ -300,8 +352,10 @@ def test_persist_survives_original_save_failure():
         wb0 = Workbook(); wb0.active["A1"] = "original"; wb0.save(input_path)
         backup_dir = td / "_backups"
 
-        with patch("run_excel.safe_save",
-                   side_effect=RuntimeError("simulated BadZipFile on input")):
+        # _copy_atomic is the sole path for writing to input_path since the
+        # 0.3.11 double-save fix — patch it to simulate a Drive/AV corruption.
+        with patch("run_excel._copy_atomic",
+                   side_effect=RuntimeError("simulated write failure on input")):
             results_backup = _persist_workbook_with_backup(
                 wb, input_path, backup_dir, keep=20
             )   # must NOT raise
@@ -309,8 +363,34 @@ def test_persist_survives_original_save_failure():
         # RESULTS captured the scrape
         assert results_backup.exists()
         assert load_workbook(results_backup).active["A1"].value == "scraped"
-        # Input file unchanged (safe_save raised → original preserved)
+        # Input file unchanged (copy raised → original preserved)
         assert load_workbook(input_path).active["A1"].value == "original"
+
+
+def test_persist_permission_error_falls_back_to_stem2():
+    """Input file locked (Excel open) → copy to <stem>2.xlsx as documented."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        wb = Workbook(); wb.active["A1"] = "scraped"
+        input_path = td / "input.xlsx"
+        Workbook().save(input_path)
+        backup_dir = td / "_backups"
+
+        # First copy attempt raises PermissionError → second (to <stem>2) succeeds.
+        calls = {"n": 0}
+        real_copy = re_mod._copy_atomic
+        def flaky_copy(src, dst):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise PermissionError("simulated: input xlsx open in Excel")
+            return real_copy(src, dst)
+
+        with patch("run_excel._copy_atomic", side_effect=flaky_copy):
+            _persist_workbook_with_backup(wb, input_path, backup_dir, keep=20)
+
+        alt = input_path.with_stem(input_path.stem + "2")
+        assert alt.exists(), "PermissionError path must write <stem>2.xlsx"
+        assert load_workbook(alt).active["A1"].value == "scraped"
 
 
 def test_persist_backup_save_failure_still_raises():
@@ -358,6 +438,8 @@ if __name__ == "__main__":
     test_prune_results_ignores_non_results_files()
     test_prune_results_keep_zero_or_none_is_no_op()
     test_persist_writes_results_backup_and_input_when_both_succeed()
+    test_persist_survives_workbook_with_embedded_image()
     test_persist_survives_original_save_failure()
+    test_persist_permission_error_falls_back_to_stem2()
     test_persist_backup_save_failure_still_raises()
     print("ALL PASS")
