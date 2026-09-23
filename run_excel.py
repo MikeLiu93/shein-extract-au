@@ -261,60 +261,34 @@ def safe_save(wb, xlsx_path: Path) -> None:
         logger.info("Saved to alternate: %s", alt.name)
 
 
-def _copy_atomic(src: Path, dst: Path) -> None:
-    """Atomically copy src → dst. Writes to a temp file next to dst, then
-    os.replace. Preserves the source's zip integrity — critical for xlsx
-    since we don't want a torn write to look like a valid workbook."""
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_name(f".{dst.stem}.copytmp-{os.getpid()}{dst.suffix}")
-    try:
-        shutil.copy2(src, tmp)
-        os.replace(tmp, dst)
-    except Exception:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
-        raise
-
-
 def _persist_workbook_with_backup(wb, input_path: Path,
                                    backup_dir: Path, keep: int) -> Path:
     """Backup-first save (2026-09-10 → refined 2026-09-23):
 
-    有员工机器上 wb.save() 完成后，openpyxl 写出来的临时文件被 Google Drive
-    客户端 / EDR 抢锁改写，第一步 zip 校验就炸 (BadZipFile)。原表写不进去
-    员工的抓取成果就全没了。所以 always 先往 _backups/ 存一份带结果的 xlsx
-    (那个路径通常没问题)，然后 **文件拷贝** 到原表——**不要再调一次 wb.save()**。
+    先把结果存到 _backups/<name>-<ts>-RESULTS.xlsx，再存回原表——原表失败
+    时只打警告不 crash，员工从备份夹拷回去就行。
 
-    2026-09-23 修：openpyxl 的 wb.save() 对带 embedded 图片的 workbook 不能
-    连调两次——第一次会消耗 image 的 BytesIO buffer，第二次读不到图，写出来
-    的 xlsx 缺 [Content_Types].xml → BadZipFile。0.3.10 里两次 save 同一个 wb
-    正好踩这个雷，员工那边就一直写不进原表。改成 save 一次 + shutil.copy2
-    可靠得多：拷贝一个已经通过 zip 校验的完整文件不会中间坏掉。
-
-    Returns the RESULTS backup path. Raises if the backup save itself fails
-    (should not happen on a healthy backup dir; if it does, it's serious).
+    save_workbook_atomic 现在走"本地盘 tmp + 校验 + 拷到目标卷 + 原子替换"
+    的架构（本文件跟美国站保持一致），且在保存前会 _harden_workbook_images
+    把每张图的字节钉住——同一个 wb 可以反复 save 而不会因为 BytesIO buffer
+    被消耗而产出坏文件。
     """
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     results_backup = (backup_dir
                       / f"{input_path.stem}-{ts}{RESULTS_SUFFIX}{input_path.suffix}")
     backup_dir.mkdir(parents=True, exist_ok=True)
-    save_workbook_atomic(wb, results_backup)   # ← 唯一一次 wb.save()
+    save_workbook_atomic(wb, results_backup)
     logger.info("结果已存到备份夹: %s", results_backup)
     _prune_results_backups(backup_dir, input_path.stem, keep=keep)
 
-    # Copy the verified RESULTS file → input path. Never a second wb.save().
     try:
-        _copy_atomic(results_backup, input_path)
+        save_workbook_atomic(wb, input_path)
         logger.info("同时写回原表: %s", input_path.name)
     except PermissionError:
-        # 原表被 Excel 打开锁住时的老退路：写到 <stem>2.xlsx。
         alt = input_path.with_stem(input_path.stem + "2")
         try:
-            _copy_atomic(results_backup, alt)
-            logger.warning("原表被占用（Excel 开着？）→ 结果已复制到 %s", alt.name)
+            save_workbook_atomic(wb, alt)
+            logger.warning("原表被占用（Excel 开着？）→ 结果已存到 %s", alt.name)
         except Exception as e:
             logger.warning(
                 "[!] 写回原表 %s 和退路 %s 都失败: %s。\n"

@@ -12,9 +12,9 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
-import run_excel as re_mod
 from unittest.mock import patch
 
+import run_excel as re_mod  # noqa: F401 — used by patch("run_excel.…")
 from run_excel import (
     COL_SEQ, COL_URL, COL_PRICE, COL_SHIPPING, COL_VARIANT_FILTER,
     COL_DATE, COL_STATUS,
@@ -343,8 +343,8 @@ def test_persist_writes_results_backup_and_input_when_both_succeed():
 
 
 def test_persist_survives_original_save_failure():
-    """The bug the employee hit: something goes wrong at input-file write time.
-    RESULTS backup must land AND function must return normally (no crash)."""
+    """Something goes wrong at input-file write time — RESULTS backup must
+    still land AND function must return normally (no crash)."""
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         wb = Workbook(); wb.active["A1"] = "scraped"
@@ -352,10 +352,16 @@ def test_persist_survives_original_save_failure():
         wb0 = Workbook(); wb0.active["A1"] = "original"; wb0.save(input_path)
         backup_dir = td / "_backups"
 
-        # _copy_atomic is the sole path for writing to input_path since the
-        # 0.3.11 double-save fix — patch it to simulate a Drive/AV corruption.
-        with patch("run_excel._copy_atomic",
-                   side_effect=RuntimeError("simulated write failure on input")):
+        # save_workbook_atomic is called twice: once for RESULTS, once for
+        # input. Wrap to succeed on RESULTS then simulate a corruption failure
+        # on the input write.
+        real_save = re_mod.save_workbook_atomic
+        def flaky_save(wb_, dst):
+            if Path(dst).resolve() == input_path.resolve():
+                raise RuntimeError("simulated Drive corruption on input write")
+            return real_save(wb_, dst)
+
+        with patch("run_excel.save_workbook_atomic", side_effect=flaky_save):
             results_backup = _persist_workbook_with_backup(
                 wb, input_path, backup_dir, keep=20
             )   # must NOT raise
@@ -363,12 +369,12 @@ def test_persist_survives_original_save_failure():
         # RESULTS captured the scrape
         assert results_backup.exists()
         assert load_workbook(results_backup).active["A1"].value == "scraped"
-        # Input file unchanged (copy raised → original preserved)
+        # Input unchanged (save raised → atomic guarantee preserves original)
         assert load_workbook(input_path).active["A1"].value == "original"
 
 
 def test_persist_permission_error_falls_back_to_stem2():
-    """Input file locked (Excel open) → copy to <stem>2.xlsx as documented."""
+    """Input file locked (Excel open) → save to <stem>2.xlsx as documented."""
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         wb = Workbook(); wb.active["A1"] = "scraped"
@@ -376,16 +382,14 @@ def test_persist_permission_error_falls_back_to_stem2():
         Workbook().save(input_path)
         backup_dir = td / "_backups"
 
-        # First copy attempt raises PermissionError → second (to <stem>2) succeeds.
-        calls = {"n": 0}
-        real_copy = re_mod._copy_atomic
-        def flaky_copy(src, dst):
-            calls["n"] += 1
-            if calls["n"] == 1:
+        # PermissionError on the input write only; RESULTS and <stem>2 succeed.
+        real_save = re_mod.save_workbook_atomic
+        def flaky_save(wb_, dst):
+            if Path(dst).resolve() == input_path.resolve():
                 raise PermissionError("simulated: input xlsx open in Excel")
-            return real_copy(src, dst)
+            return real_save(wb_, dst)
 
-        with patch("run_excel._copy_atomic", side_effect=flaky_copy):
+        with patch("run_excel.save_workbook_atomic", side_effect=flaky_save):
             _persist_workbook_with_backup(wb, input_path, backup_dir, keep=20)
 
         alt = input_path.with_stem(input_path.stem + "2")

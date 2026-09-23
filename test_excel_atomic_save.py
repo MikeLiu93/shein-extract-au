@@ -12,6 +12,7 @@ import tempfile
 import zipfile
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import patch
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as XLImage
@@ -66,21 +67,45 @@ def test_atomic_save_leaves_original_intact_when_save_raises():
         _good_workbook(target, "员工积累了几个月的数据")
         before = target.read_bytes()
 
-        # 造一个保存时必炸的工作簿：图片指向一个待会儿会被删掉的文件
-        img = _make_webp(tmp / "victim.webp")
         wb = Workbook()
-        wb.active.add_image(XLImage(str(img)), "H2")
-        img.unlink()                      # 保存时 _data() 会读不到
+        wb.active["A1"] = "本轮的新内容"
 
-        try:
-            save_workbook_atomic(wb, target)
-            raised = False
-        except Exception:
-            raised = True
+        # openpyxl 内部炸掉：Workbook.save 抛异常 → save_workbook_atomic
+        # 在校验前就失败 → 原表一个字节都没动过（core atomic 保证）。
+        with patch("openpyxl.workbook.workbook.Workbook.save",
+                   side_effect=RuntimeError("simulated openpyxl mid-write failure")):
+            try:
+                save_workbook_atomic(wb, target)
+                raised = False
+            except Exception:
+                raised = True
 
         assert raised, "保存该失败却成功了，测试前提不成立"
         assert target.read_bytes() == before, "原文件被改动了"
         assert _is_openable(target), "原文件损坏了"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_broken_image_is_dropped_instead_of_killing_save():
+    """图片读不出来时应该只丢掉那一张，其他内容照常保存 —— 不能因为一张
+    烂图把整轮抓取的成果拖下水（v0.3.10/v0.3.11 前的行为）。"""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        target = tmp / "带烂图的表.xlsx"
+        img = _make_webp(tmp / "victim.webp")
+
+        wb = Workbook()
+        wb.active["A1"] = "新内容"
+        wb.active.add_image(XLImage(str(img)), "H2")
+        img.unlink()   # save 时 _data() 会读不到
+
+        save_workbook_atomic(wb, target)   # 不该抛
+        assert load_workbook(target).active["A1"].value == "新内容"
+        # 那张烂图被 _harden_workbook_images 丢掉了
+        z = zipfile.ZipFile(target)
+        media = [n for n in z.namelist() if n.startswith("xl/media/")]
+        assert media == [], f"烂图应被丢弃却留在了 xlsx 里: {media}"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -204,6 +229,135 @@ def test_embedded_image_is_compressed_not_full_resolution():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── 2026-09-23: local-tmp + copy-to-destination architecture ────────────────
+
+def test_workbook_is_verified_before_anything_touches_the_destination():
+    """openpyxl 绝不能直接往目标目录里流式写。
+
+    目标一般是 Google Drive 的虚拟盘：刚写完的大文件立刻读回来经常还没
+    落地，`zipfile.ZipFile()` 直接 BadZipFile —— 文件是好的，是「写完
+    马上读回」这一眼不可靠（员工的 v0.3.10/v0.3.11 现场，美国站 2026-08-17
+    也踩过同一个坑）。所以自检必须在本地盘上做完，目标盘只接一次已经
+    验证过的整文件拷贝。
+    """
+    import shein_scraper
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        dest_dir = tmp / "云盘"
+        dest_dir.mkdir()
+        target = dest_dir / "总表.xlsx"
+
+        written_to = []
+        orig = shein_scraper._write_workbook_to_temp
+
+        def spy(wb, path):
+            written_to.append(Path(path))
+            return orig(wb, path)
+
+        shein_scraper._write_workbook_to_temp = spy
+        try:
+            wb = Workbook()
+            wb.active["A1"] = "x"
+            save_workbook_atomic(wb, target)
+        finally:
+            shein_scraper._write_workbook_to_temp = orig
+
+        assert written_to, "根本没调用 _write_workbook_to_temp"
+        for p in written_to:
+            assert dest_dir not in p.parents, (
+                f"openpyxl 直接写进了目标目录: {p}")
+        assert _is_openable(target)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_save_survives_a_destination_that_lies_on_read_back():
+    """目标盘刚写完的文件读回来是坏的 —— 保存仍然必须成功。
+
+    员工的 v0.3.11 现场：`wb.save(tmp)` 成功，紧接着 `zipfile.ZipFile(tmp)`
+    抛 BadZipFile。文件其实是好的，是那一眼读回来不可靠。自检搬到本地盘
+    之后这条路就不该再炸。
+    """
+    import shein_scraper
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        dest_dir = tmp / "云盘"
+        dest_dir.mkdir()
+        target = dest_dir / "总表.xlsx"
+
+        real_zipfile = shein_scraper.zipfile.ZipFile
+
+        class LyingZipFile(real_zipfile):
+            def __init__(self, file, *a, **kw):
+                if dest_dir in Path(str(file)).parents:
+                    raise zipfile.BadZipFile("File is not a zip file")
+                super().__init__(file, *a, **kw)
+
+        shein_scraper.zipfile.ZipFile = LyingZipFile
+        try:
+            img = _make_webp(tmp / "img_001.webp")
+            wb = Workbook()
+            wb.active["A1"] = "抓了一整轮的结果"
+            _add_picture_to_cell(wb.active, 2, 8, img)
+            save_workbook_atomic(wb, target)
+        finally:
+            shein_scraper.zipfile.ZipFile = real_zipfile
+
+        assert _is_openable(target)
+        assert load_workbook(target).active["A1"].value == "抓了一整轮的结果"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_workbook_with_images_can_be_saved_twice():
+    """备份优先 + 回写原表的流程会对同一个 wb 存两次。第二次不能因为图片
+    被 close 掉而炸（v0.3.10/v0.3.11 员工现场）。"""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        img = _make_webp(tmp / "img_001.webp")
+        wb = Workbook()
+        ws1 = wb.active
+        ws1.title = "Test1"
+        ws2 = wb.create_sheet("Test2")
+        _add_picture_to_cell(ws1, 2, 8, img)
+        target = tmp / "总表.xlsx"
+
+        save_workbook_atomic(wb, target)          # 第一次
+        _add_picture_to_cell(ws2, 2, 8, img)
+        save_workbook_atomic(wb, target)          # 第二次 —— 以前在这里炸
+        save_workbook_atomic(wb, target)          # 第三次也要活着
+
+        z = zipfile.ZipFile(target)
+        media = [n for n in z.namelist() if n.startswith("xl/media/")]
+        assert len(media) == 2, media
+        assert "[Content_Types].xml" in z.namelist()
+        assert _is_openable(target)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_reloaded_workbook_images_survive_repeated_saves():
+    """load_workbook 读出来的图也是 BytesIO ref —— 同样要能反复存。"""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        img = _make_webp(tmp / "img_001.webp")
+        wb = Workbook()
+        _add_picture_to_cell(wb.active, 2, 8, img)
+        target = tmp / "已有图的总表.xlsx"
+        save_workbook_atomic(wb, target)
+
+        wb2 = load_workbook(target)
+        assert len(wb2.active._images) == 1
+        save_workbook_atomic(wb2, target)
+        save_workbook_atomic(wb2, target)
+        media = [n for n in zipfile.ZipFile(target).namelist()
+                 if n.startswith("xl/media/")]
+        assert len(media) == 1, media
+        assert _is_openable(target)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_many_images_all_land():
     """60 张图全部落盘，且清单完整 —— 就是出事的那个规模。"""
     tmp = Path(tempfile.mkdtemp())
@@ -227,6 +381,7 @@ def test_many_images_all_land():
 if __name__ == "__main__":
     test_atomic_save_writes_new_content_on_success()
     test_atomic_save_leaves_original_intact_when_save_raises()
+    test_broken_image_is_dropped_instead_of_killing_save()
     test_atomic_save_leaves_no_temp_files_behind()
     test_atomic_save_creates_file_that_did_not_exist()
     test_picture_bytes_are_read_eagerly_not_at_save_time()
@@ -234,5 +389,9 @@ if __name__ == "__main__":
     test_missing_image_file_is_skipped()
     test_webp_is_converted_so_excel_can_show_it()
     test_embedded_image_is_compressed_not_full_resolution()
+    test_workbook_is_verified_before_anything_touches_the_destination()
+    test_save_survives_a_destination_that_lies_on_read_back()
+    test_workbook_with_images_can_be_saved_twice()
+    test_reloaded_workbook_images_survive_repeated_saves()
     test_many_images_all_land()
     print("ALL PASS")

@@ -1724,24 +1724,47 @@ def _picture_column_inner_width_px(ws, col: int) -> int:
 
 
 def save_workbook_atomic(wb, path) -> "Path":
-    """保存工作簿：先写同目录的临时文件 → 验证能打开 → 原子替换目标。
+    """保存工作簿：本地盘写临时文件并自检 → 拷到目标卷 → 原子替换目标。
 
     直接 `wb.save(目标)` 是危险的：openpyxl 流式写 zip，`[Content_Types].xml`
     最后才写。保存中途抛异常（比如某张图读不到）会留下一个「有图片、没清单」
-    的半截文件，而原内容已经被覆盖 —— 员工的总表就是这么坏的。
+    的半截文件，而原内容已经被覆盖。
 
-    临时文件放在同一个目录（同一卷）才能保证 os.replace 是原子的。
-    保存失败时目标文件一个字节都不会变，异常原样抛给调用方。
+    自检必须在本地盘做：目标一般是 Google Drive 的虚拟盘（G:\\共享云端硬盘），
+    刚写完的大文件立刻读回来经常还没落地，zipfile 直接 BadZipFile —— 文件
+    其实是好的，是「写完马上读回」这一眼不可靠（员工的 v0.3.10/v0.3.11 现场；
+    美国站 2026-08-17 也踩过同一个坑）。本地盘读回是可靠的，openpyxl 写到
+    一半炸掉照样能在这里拦住。目标卷只接一次已经验证过的整文件拷贝，落在
+    同一卷上 os.replace 才是原子的。保存失败时目标文件一个字节都不会变。
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.stem}.tmp-{os.getpid()}-{threading.get_ident()}.xlsx")
+    tag = f"{os.getpid()}-{threading.get_ident()}"
+    tmp = path.with_name(f".{path.stem}.tmp-{tag}.xlsx")
 
-    err = _write_workbook_to_temp(wb, tmp)
+    # ① 先写**本地磁盘**的临时文件并自检。
+    local_tmp = Path(tempfile.gettempdir()) / f".shein-au-save-{tag}.xlsx"
+    err = _write_workbook_to_temp(wb, local_tmp)
     if err is not None:
-        _discard_temp(tmp)
+        _discard_temp(local_tmp)
         raise ExcelSaveError(f"{path.name} 保存失败（原文件未改动）: {err}")
 
+    # ② 复制到目标卷的临时文件（os.replace 要同卷才是原子的）
+    try:
+        expect = local_tmp.stat().st_size
+        shutil.copyfile(local_tmp, tmp)
+        got = _settled_size(tmp, expect)
+        if got != expect:
+            raise ExcelSaveError(
+                f"{path.name} 保存失败（原文件未改动）: "
+                f"复制到目标盘后大小对不上（{got} != {expect}）")
+    except BaseException:
+        _discard_temp(tmp)
+        raise
+    finally:
+        _discard_temp(local_tmp)
+
+    # ③ 原子替换
     try:
         os.replace(tmp, path)
     except OSError:
@@ -1750,8 +1773,56 @@ def save_workbook_atomic(wb, path) -> "Path":
     return path
 
 
+def _settled_size(p: "Path", expect: int, tries: int = 5) -> int:
+    """读 `p` 的大小，等它稳定到 `expect`。云盘刚落地时 stat 可能还是旧值。"""
+    size = -1
+    for i in range(tries):
+        try:
+            size = p.stat().st_size
+        except OSError:
+            size = -1
+        if size == expect:
+            return size
+        time.sleep(0.4 * (i + 1))
+    return size
+
+
 class ExcelSaveError(Exception):
     """写临时文件阶段失败。目标文件保证没被动过。"""
+
+
+def _cache_image_bytes(img, data: bytes) -> None:
+    """把 `data` 钉成这张图的字节，之后每次 save 都返回同一份。
+
+    openpyxl 的 `Image._data()` 读完字节就 `fp.close()`，而那个 fp 就是
+    `img.ref` 那个 BytesIO —— 不管是 `_add_picture_to_cell` 塞进去的，还是
+    `load_workbook` 从已有文件里读出来的。不钉住的话同一个 wb 存第二次必然抛
+    `ValueError: I/O operation on closed file`，多 sheet 或"备份+回写原表"
+    这种流程就会在第二个 save 上中断（v0.3.10/v0.3.11 现场）。
+    """
+    img._cached_bytes = data
+    img._data = lambda _d=data: _d
+
+
+def _harden_workbook_images(wb) -> None:
+    """保存前把每张图的字节钉住。读不出来的图直接摘掉，不能拖累整次保存。"""
+    for ws in getattr(wb, "worksheets", []):
+        images = getattr(ws, "_images", None)
+        if not images:
+            continue
+        kept = []
+        for img in images:
+            if getattr(img, "_cached_bytes", None) is None:
+                try:
+                    data = img._data()
+                except Exception as e:
+                    print(f"  [图片] 保存时跳过一张读不出来的图: "
+                          f"{type(e).__name__}: {e}")
+                    continue
+                _cache_image_bytes(img, data)
+            kept.append(img)
+        if len(kept) != len(images):
+            ws._images = kept
 
 
 def _write_workbook_to_temp(wb, tmp: "Path") -> "str | None":
@@ -1761,6 +1832,7 @@ def _write_workbook_to_temp(wb, tmp: "Path") -> "str | None":
     close 的 ZipFile，Windows 上就删不掉 tmp 了。只带走类型和消息。
     """
     try:
+        _harden_workbook_images(wb)
         wb.save(tmp)
         with zipfile.ZipFile(tmp) as z:
             if z.testzip() is not None:
